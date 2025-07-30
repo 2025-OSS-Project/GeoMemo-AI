@@ -1,0 +1,59 @@
+name: 📨 Discord Issue & PR 알림 (임베드 버전)
+
+on:
+  issues:
+    types: [opened, closed, reopened, edited]
+  pull_request:
+    types: [opened, closed, reopened, synchronize]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1) 레포지토리별 웹훅 선택
+    - name: Select Discord webhook
+      id: hook
+      run: |
+        case "${GITHUB_REPOSITORY}" in
+          2025-OSS-Project/GeoMemo-Backend)  echo "url=${{ secrets.WEBHOOK_BACKEND }}"  >> $GITHUB_OUTPUT ;;
+          2025-OSS-Project/GeoMemo-Frontend) echo "url=${{ secrets.WEBHOOK_FRONTEND }}" >> $GITHUB_OUTPUT ;;
+          2025-OSS-Project/GeoMemo-AI)       echo "url=${{ secrets.WEBHOOK_AI }}"       >> $GITHUB_OUTPUT ;;
+          *) echo "::error::알 수 없는 레포지토리"; exit 1 ;;
+        esac
+
+    # 2-A) Issue 알림 ─ 열린/닫힘/수정 별 색상·메시지
+    - name: Issue event → Discord
+      if: github.event_name == 'issues'
+      uses: sarisia/actions-status-discord@v1  # JS 액션, embed 지원 :contentReference[oaicite:2]{index=2}
+      with:
+        webhook: ${{ steps.hook.outputs.url }}
+        username: Issue Bot 🐛
+        avatar_url: https://raw.githubusercontent.com/github/explore/main/topics/github-actions/github-actions.png
+        color: ${{ github.event.action == 'opened' && '0x00B0F4' || github.event.action == 'closed' && '0x808080' || '0xF4D742' }}
+        title: |
+          🐛 Issue #${{ github.event.issue.number }} ${{ github.event.action }}
+        url: ${{ github.event.issue.html_url }}
+        description: |
+          **${{ github.event.issue.title }}**
+          ↳ 작성자: <https://github.com/${{ github.event.issue.user.login }}>
+          ↳ 레이블: ${{ join(github.event.issue.labels.*.name, ', ') }}
+          ↳ 상태: ${{ github.event.issue.state }}
+
+    # 2-B) PR 알림 ─ 머지/열림/동기화 별 색상·필드
+    - name: Pull-Request event → Discord
+      if: github.event_name == 'pull_request'
+      uses: sarisia/actions-status-discord@v1
+      with:
+        webhook: ${{ steps.hook.outputs.url }}
+        username: PR Bot 🚀
+        color: ${{ github.event.action == 'closed' && github.event.pull_request.merged == true && '0x57F287' || github.event.action == 'opened' && '0xF47FFF' || '0xFAA61A' }}
+        title: |
+          🚀 PR #${{ github.event.pull_request.number }} ${{ github.event.action }}
+        url: ${{ github.event.pull_request.html_url }}
+        description: |
+          **${{ github.event.pull_request.title }}**
+          ↳ 작성자: <https://github.com/${{ github.event.pull_request.user.login }}>
+          ↳ 브랜치: `${{ github.event.pull_request.head.ref }} → ${{ github.event.pull_request.base.ref }}`
+          ↳ 커밋: ${{ github.event.pull_request.commits }}
+          ↳ 변경 파일: ${{ github.event.pull_request.changed_files }}
