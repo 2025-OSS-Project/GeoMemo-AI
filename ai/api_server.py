@@ -1,85 +1,46 @@
-# ai/api_server.py
-import os, logging
-from typing import List, Dict, Set
+import torch, json, os
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "kc_saved_model")
+tok   = AutoTokenizer.from_pretrained(MODEL_DIR)
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
+model.eval()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
 
-from .recommender import recommend_top_n
-from .recommender.schema import Place, Memo
+# ── id2label 로드
+with open(os.path.join(MODEL_DIR, "id2label.json"), encoding="utf-8") as f:
+    id2label = json.load(f)
+id2label = {int(k): v for k, v in id2label.items()}
 
-app = FastAPI(title="AI Recommender", version="1.0")
+# ── stage1 매핑 생성
+positive_set = {"기쁨", "놀람"}
+stage1_map   = {lbl: ("긍정" if lbl in positive_set else "부정")
+                for lbl in id2label.values()}
 
-# ─────────────────────────────────────────────
-# 1) Redis or DummyRedis 초기화 (비동기)
-# ─────────────────────────────────────────────
-class DummyRedis:
-    async def hget(self, *a, **k): return None
-    async def smembers(self, *a, **k): return set()
+def kc_predict(text: str):
+    inputs = tok(text, return_tensors="pt",
+                 truncation=True, padding=True, max_length=128)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        logits = model(**inputs).logits
 
-r = DummyRedis()             # 기본값 → startup에서 교체될 수 있음
+    probs  = torch.softmax(logits, dim=-1)[0]
+    idx    = int(torch.argmax(probs))
+    prob   = float(probs[idx])
 
-@app.on_event("startup")
-async def init_redis():
-    global r
-    try:
-        import redis.asyncio as redis
-        REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        conn = redis.from_url(REDIS_URL, decode_responses=True)
-        await conn.ping()          # 접속 테스트
-        r = conn                   # 성공 시 전역 r 교체
-        logging.info(f"[api] Redis connected ➜ {REDIS_URL}")
-    except Exception as e:
-        logging.warning(f"[api] Redis unavailable → DummyRedis in use ({e})")
+    # 강도 구간
+    strength = "강" if prob >= 0.9 else "보통" if prob >= 0.6 else "약"
 
-# ─────────────────────────────────────────────
-# 2) 메모·스크랩·팔로우(목업 캐시)  ─ 실제 환경에선 DB/Redis
-# ─────────────────────────────────────────────
-user_memos_cache: Dict[int, List[Memo]] = {}
-scraps_by_user_cache: Dict[int, List[int]] = {}
-followings_by_user_cache: Dict[int, List[int]] = {}
+    label   = id2label[idx]
+    stage1  = stage1_map[label]          # ⭐ 긍정 / 부정
 
-# ─────────────────────────────────────────────
-# 3) Request 모델
-# ─────────────────────────────────────────────
-class RecomReq(BaseModel):
-    userId: int = Field(..., example=12)
-    candidates: List[Place]
-    top: int = Field(5, ge=1, le=20)
+    return {
+        "stage1": stage1,                # "긍정" or "부정"
+        "label" : label,                 # 세부 감정
+        "prob"  : round(prob, 3),
+        "strength": strength
+    }
 
-# ─────────────────────────────────────────────
-# 4) 추천 엔드포인트
-# ─────────────────────────────────────────────
-@app.post("/ai/v1/recommendations")
-async def recommend(req: RecomReq):
-    try:
-        # ① 장소별 긍정 비율·작성자 집합 로드
-        pos_ratio: Dict[int, float] = {}
-        pos_auths: Dict[int, Set[int]] = {}
-        for pl in req.candidates:
-            pid = pl.placeId
-            val = await r.hget("place_pos_ratio", pid)
-            pos_ratio[pid] = float(val) if val else 0.0
-            ids = await r.smembers(f"positive_authors:{pid}")
-            pos_auths[pid] = {int(i) for i in ids}
-
-        # ② 추천 계산
-        result = recommend_top_n(
-            user_id=req.userId,
-            candidate_places=req.candidates,
-            user_memos={req.userId: user_memos_cache.get(req.userId, [])},
-            scraps_by_user={req.userId: scraps_by_user_cache.get(req.userId, [])},
-            follow_by_user={req.userId: followings_by_user_cache.get(req.userId, [])},
-            place_positive_ratio=pos_ratio,
-            positive_authors=pos_auths,
-            top_n=req.top
-        )
-        return result
-
-    except Exception as e:
-        logging.exception("recommendation failed")
-        raise HTTPException(500, detail=f"recommendation failed: {e}")
-
-@app.get("/ai/v1/health")
-def health():
-    return {"status": "ok"}
+if __name__ == "__main__":
+    print(kc_predict("오늘 친구랑 커피를 마시며 즐거운 시간을 보냈어!"))
