@@ -14,3 +14,5 @@ openai~=1.30
 pydantic-settings>=2.2.1
 python-dotenv>=1.0.1   
 stomp.py>=8.1.0      # Amazon MQ(STOMP) 클라이언트
+pika
+aio_pika
