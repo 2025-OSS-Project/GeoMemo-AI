@@ -1,4 +1,4 @@
-# ai/mq_recommender_worker.py
+# ai/recommender/mq_recommender_worker.py
 from __future__ import annotations
 import os, json, time, asyncio
 from typing import Dict, List, Set, Optional, Any
