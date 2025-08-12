@@ -1,3 +1,4 @@
 .env
 .venv/*
 kc_saved_model/*
+ai/emotion_api_server.py

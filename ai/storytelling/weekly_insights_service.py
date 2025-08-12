@@ -105,32 +105,51 @@ def _fallback_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
     return f"{top_place}에서 {dominant} 감정을 많이 느꼈고, 감정 기복이 두드러졌어요!"[:150]
 
 
+# ---------------------------------------------------------------------------
+# 공감형 GPT 시스템 메시지  ← 추가
+# ---------------------------------------------------------------------------
+SYSTEM_MSG = "당신은 사용자의 감정을 섬세하게 읽어 주는 한국인 심리상담사입니다."
+
+# ---------------------------------------------------------------------------
+# 요약 생성
+# ---------------------------------------------------------------------------
 def generate_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
+    # ① 데이터 부족·GPT 키 없음 처리
+    if not vals:
+        return "지난주엔 데이터가 부족해 특별한 패턴을 찾지 못했어요."
     if not openai.api_key:
         return _fallback_summary(vals, counts)
 
+    # ② 프롬프트 재구성
     emo_msg = ", ".join([f"{k} {v}회" for k, v in counts.items() if v])
     place_msg = ", ".join([f"{p.placeCat}({p.avgValence:+.2f})" for p in vals[:3]])
+
     prompt = (
-        "너는 사용자에게 지난주 감정 패턴을 알려주는 따뜻한 코치야.\n"
-        f"장소별 평균 감정지수: {place_msg}\n"
-        f"감정 분포: {emo_msg}\n"
-        "150자 이내로 부드럽게 요약해 줘."
+        "[지난주 감정 통계]\n\n"
+        f"장소별 평균 감정지수\n• {place_msg}\n\n"
+        f"감정 분포\n• {emo_msg}\n\n"
+        "[요청]\n"
+        "1️⃣ 데이터에서 사용자가 예상치 못했을 패턴 한 가지를 짚어 줘.\n"
+        "2️⃣ 그 의미를 따뜻하게 설명해 줘.\n"
+        "3️⃣ 감정 균형을 돕는 작은 행동 제안 1개 포함.\n"
+        "4️⃣ 150자 이내, '~해요/해보세요' 어미로 한 문장으로 답해 줘."
     )
+
     try:
         chat = openai.chat.completions.create(
             model=GPT_MODEL,
             messages=[
-                {"role": "system", "content": "당신은 공감 능력 높은 한국어 상담사입니다."},
+                {"role": "system", "content": SYSTEM_MSG},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=200,
-            temperature=0.7,
+            max_tokens=220,
+            temperature=0.65,
         )
         return chat.choices[0].message.content.strip()[:150]
     except Exception as e:
         print("[GPT error]", e)
         return _fallback_summary(vals, counts)
+
 
 # ---------------------------------------------------------------------------
 # API
