@@ -2,10 +2,9 @@
 
 AI 워커 – Amazon MQ(RabbitMQ) → 주간 인사이트 생성 → DB 저장
 ───────────────────────────────────────────────────────────────
-백엔드 ▶ (Amazon MQ queue `weekly_insights`) ▶ 이 워커 ▶ DB(InsightEntity)
+백엔드 ▶ (Amazon MQ queue `insight.req`) ▶ 이 워커 ▶ DB(InsightEntity)
 
 ### MQ 메시지 스키마 (확정)
-```json
 {
   "userId": 7,
   "logs": [
@@ -13,8 +12,7 @@ AI 워커 – Amazon MQ(RabbitMQ) → 주간 인사이트 생성 → DB 저장
     {"timestamp":"2025-08-05T14:12:00Z","label":"분노","score":0.71,"placeCat":"사무실"}
   ]
 }
-```
-기간(`weekStart`·`weekEnd`)은 메시지에 없어도 됨 — 필요하면 추가.
+기간(weekStart/weekEnd)은 생략 가능.
 """
 
 from __future__ import annotations
@@ -35,9 +33,16 @@ from pydantic import BaseModel, Field, ConfigDict
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY", "")
 GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
-AMQP_URL = os.getenv("AMQP_URL", "amqp://guest:guest@localhost:5672/")
-QUEUE_NAME = os.getenv("MQ_QUEUE", "weekly_insights")
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///geomemo.db")  # TODO 교체
+
+AMQP_URL   = os.getenv("AMQP_URL", "amqp://guest:guest@localhost:5672/")
+# 큐 이름은 MQ_QUEUE(우선) → INSIGHT_REQ_QUEUE(백엔드 설정 호환) → 기본 insight.req
+QUEUE_NAME = os.getenv("MQ_QUEUE") or os.getenv("INSIGHT_REQ_QUEUE", "insight.req")
+# RabbitMQ 큐 타입(quorum / classic)
+QUEUE_TYPE = (os.getenv("MQ_QUEUE_TYPE", "quorum") or "quorum").lower()
+# prefetch (동시처리)
+PREFETCH   = int(os.getenv("INSIGHT_PREFETCH", "16"))
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///geomemo.db")
 
 # ---------------------------------------------------------------------------
 # 감정 매핑
@@ -52,9 +57,6 @@ VALENCE_MAP = {
     "슬픔": -0.8,
 }
 
-# ---------------------------------------------------------------------------
-# 공감형 GPT 시스템 메시지
-# ---------------------------------------------------------------------------
 SYSTEM_MSG = "당신은 사용자의 감정을 섬세하게 읽어 주는 한국인 심리상담사입니다."
 
 # ---------------------------------------------------------------------------
@@ -78,7 +80,6 @@ class Job(BaseModel):
 # ---------------------------------------------------------------------------
 # 통계 함수들
 # ---------------------------------------------------------------------------
-
 def emotion_counts(logs: List[LogItem]) -> Dict[str, int]:
     counts = {lbl: 0 for lbl in EMO_LABELS}
     for l in logs:
@@ -91,15 +92,11 @@ class PlaceValence(BaseModel):
 
 def place_valences(logs: List[LogItem], top_n: int = 5) -> List[PlaceValence]:
     """
-    장소(category)별 Valence 평균을 계산.
-    동일 카테고리 최소 2건 이상일 때만 채택하여 노이즈 완화.
-
-    ✅ 중요: LogItem 에서는 내부 속성이 `category` 이므로 l.category 로 접근해야 함.
-    이전 버전의 l.placeCat 접근은 AttributeError 를 유발했습니다.
+    장소(category)별 Valence 평균 계산 (동일 카테고리 최소 2건 이상일 때만 채택).
     """
     bucket: Dict[str, List[float]] = {}
     for l in logs:
-        if l.category:  # ← FIX: l.placeCat 가 아니라 l.category 로 접근
+        if l.category:  # 내부 속성은 category
             bucket.setdefault(l.category, []).append(VALENCE_MAP.get(l.label, 0.0))
 
     aggs = [
@@ -112,12 +109,9 @@ def place_valences(logs: List[LogItem], top_n: int = 5) -> List[PlaceValence]:
 # ---------------------------------------------------------------------------
 # 요약 생성
 # ---------------------------------------------------------------------------
-
 def generate_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
-    # ① 데이터 부족 → 안내 문장
     if not vals:
         return "지난주엔 데이터가 부족해 특별한 패턴을 찾지 못했어요."
-    # ② GPT 미사용/오류 → 빈 문자열
     if not openai.api_key:
         return ""
 
@@ -147,8 +141,7 @@ def generate_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
         return chat.choices[0].message.content.strip()[:150]
     except Exception as e:
         print("[GPT error]", e)
-        return ""  # ← 실패 시 빈 문자열
-
+        return ""  # 실패 시 빈 문자열
 
 # ---------------------------------------------------------------------------
 # DB 연결 (SQLAlchemy Async)
@@ -184,22 +177,25 @@ async def on_message(msg: IncomingMessage):
             job = Job.parse_raw(msg.body)
             counts = emotion_counts(job.logs)
             vals = place_valences(job.logs)
-            summary = generate_summary(vals, counts)  # 규칙대로 생성/빈문자열
-
+            summary = generate_summary(vals, counts)
             await save_insight(job.userId, summary)
             print(f"[✓] insight saved for user {job.userId} — {len(job.logs)} logs")
         except Exception as e:
-            print("[!] job failed", e)
-            # requeue=True 이므로 실패 시 재시도
-
+            print("[!] job failed", e)  # requeue=True 이므로 실패 시 재시도
 
 async def consume_forever():
     connection = await aio_pika.connect_robust(AMQP_URL)
     async with connection:
         channel = await connection.channel()
-        queue = await channel.declare_queue(QUEUE_NAME, durable=True)
+        # prefetch 설정
+        await channel.set_qos(prefetch_count=PREFETCH)
+
+        # 큐 타입 일치(백엔드에서 quorum으로 만들어둔 경우 충돌 방지)
+        args = {"x-queue-type": "quorum"} if QUEUE_TYPE == "quorum" else None
+        queue = await channel.declare_queue(QUEUE_NAME, durable=True, arguments=args)
+
         await queue.consume(on_message, no_ack=False)
-        print("[*] Insight worker started — waiting for messages…")
+        print(f"[*] Insight worker started — queue={QUEUE_NAME}, type={QUEUE_TYPE}, prefetch={PREFETCH}")
         await asyncio.Future()
 
 # ---------------------------------------------------------------------------
