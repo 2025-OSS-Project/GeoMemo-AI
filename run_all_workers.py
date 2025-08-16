@@ -1,4 +1,4 @@
-# scripts/run_all_workers.py
+# run_all_workers.py  (PROJECT_ROOT에 둠)
 from __future__ import annotations
 import os, sys, time, signal, subprocess, threading, importlib.util
 from pathlib import Path
@@ -8,7 +8,7 @@ try:
 except Exception:
     load_dotenv = None  # optional
 
-ROOT = Path(__file__).resolve().parents[1]   # 프로젝트 루트
+ROOT = Path(__file__).resolve().parent        # ← 루트 폴더
 ENV_PATH = ROOT / ".env"
 
 def exists_module(modname: str) -> bool:
@@ -40,6 +40,7 @@ def spawn(name: str, cmd: list[str], env: dict):
         time.sleep(5)
 
 def main():
+    # .env 로드
     if load_dotenv and ENV_PATH.exists():
         load_dotenv(ENV_PATH)
 
@@ -48,12 +49,25 @@ def main():
         if not os.getenv(k):
             print(f"[FATAL] Missing env: {k}"); sys.exit(1)
 
+    # 큐 이름 기본값(백엔드와 맞추기)
+    os.environ.setdefault("INSIGHT_REQ_QUEUE", os.getenv("MQ_QUEUE", "insight.req"))
+    os.environ.setdefault("EMOTION_REQ_QUEUE", os.getenv("EMOTION_REQ_QUEUE", "emotion.req"))
+
+    # 추천 워커 모듈 경로 자동 탐색
+    reco_mods = [
+        "ai.recommender.mq_recommender_worker",  # ai/recommender/mq_recommender_worker.py
+        "ai.mq_recommender_worker",              # ai/mq_recommender_worker.py
+    ]
+    reco_mod = next((m for m in reco_mods if exists_module(m)), None)
+    if not reco_mod:
+        print("[FATAL] cannot find recommender worker module")
+        sys.exit(3)
+
     py = sys.executable
     procs = [
-        ("cache",        [py, "-m", "ai.infra.mq_consumer"]),
-        ("recommender",  [py, "-m", "ai.recommender.mq_recommender_worker"]),
-        # ★ 감정 + 인사이트를 통합 모듈 하나로 실행
-        ("emo+insight",  [py, "-m", "ai.infra.mq_emotion"]),
+        ("cache",       [py, "-m", "ai.infra.mq_consumer"]),
+        ("recommender", [py, "-m", reco_mod]),
+        ("emo+insight", [py, "-m", "ai.infra.mq_emotion"]),  # 감정+인사이트 통합
     ]
 
     env = os.environ.copy()
