@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os, json, asyncio, logging, re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
 from collections import Counter, defaultdict
@@ -14,6 +15,9 @@ from sqlalchemy import text
 
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+# === OpenAI (GPT 요약용) ===
+import openai
 
 # ────────────────────────────────────────────────────────────
 # ENV & Logging
@@ -43,6 +47,11 @@ INSIGHT_STATUS_DONE  = os.getenv("INSIGHT_STATUS", "DONE")
 INSIGHT_STATUS_PROC  = os.getenv("INSIGHT_STATUS_PROCESSING", "PROCESSING")
 INSIGHT_STATUS_FAIL  = os.getenv("INSIGHT_STATUS_FAILED", "FAILED")
 
+# GPT
+openai.api_key = os.getenv("OPENAI_API_KEY", "")
+GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
+SYSTEM_MSG = "당신은 사용자의 감정을 섬세하게 읽어 주는 한국인 심리상담사입니다."
+
 # HF model dir (local path on the machine where workers run)
 EMO_MODEL_DIR = os.getenv("EMO_MODEL_DIR")
 if not EMO_MODEL_DIR:
@@ -53,11 +62,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("`.env`에 DATABASE_URL이 없습니다.")
 
-# Optional: RDS SSL (필요 시 .env에 MYSQL_SSL=1, 그리고 CA 경로 지정 가능)
+# Optional: RDS SSL
 USE_MYSQL_SSL = os.getenv("MYSQL_SSL", "0") in ("1", "true", "True")
 connect_args = {}
 if USE_MYSQL_SSL:
-    # RDS CA 검증을 하려면 {"ca": "/path/to/rds-ca.pem"} 등으로 지정
     connect_args["ssl"] = {}
 
 engine: AsyncEngine = create_async_engine(
@@ -137,48 +145,93 @@ async def analyze_emotion_text(text_str: str) -> Tuple[str, float]:
     return await asyncio.to_thread(_infer_sync, text_str)
 
 # ────────────────────────────────────────────────────────────
-# Insight summarize
+# Insight: 통계 → GPT 요약
 # ────────────────────────────────────────────────────────────
+EMO_LABELS = ["기쁨", "놀람", "분노", "불안", "상처", "슬픔"]
+VALENCE_MAP = {
+    "기쁨": 1.0,
+    "놀람": 0.2,
+    "분노": -0.9,
+    "불안": -0.6,
+    "상처": -0.7,
+    "슬픔": -0.8,
+}
+
 def _normalize_log_item(d: Dict[str, Any]) -> Dict[str, Any]:
-    """placeCat→category, name→placeName 같은 alias를 통일."""
+    """placeCat→category, name→placeName 등 alias 통일."""
     if "category" not in d and "placeCat" in d:
         d["category"] = d.get("placeCat")
     if "placeName" not in d and "name" in d:
         d["placeName"] = d.get("name")
     return d
 
-def _summarize_logs(logs: List[Dict[str, Any]]) -> str:
-    logs = [_normalize_log_item(dict(it)) for it in logs or []]
-    n = len(logs)
-    if n == 0:
-        return "최근 로그가 없어 인사이트를 생성하지 않았습니다."
+def emotion_counts(logs: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {lbl: 0 for lbl in EMO_LABELS}
+    for raw in logs:
+        l = (_normalize_log_item(dict(raw)).get("label") or "").strip()
+        if l in counts:
+            counts[l] += 1
+    return counts
 
-    by_label = Counter([(item.get("label") or "").strip() for item in logs])
-    by_cat   = Counter([(item.get("category") or "").strip() for item in logs if item.get("category")])
-    by_place = Counter([(item.get("placeName") or "").strip() for item in logs if item.get("placeName")])
+@dataclass
+class PlaceValence:
+    placeCat: str
+    avgValence: float
 
-    avg_score_by_label: Dict[str, List[float]] = defaultdict(list)
-    for it in logs:
+def place_valences(logs: List[Dict[str, Any]], top_n: int = 5) -> List[PlaceValence]:
+    """
+    장소(category)별 valence 평균. 동일 카테고리 2건 이상일 때만 채택(노이즈 완화).
+    """
+    bucket: Dict[str, List[float]] = defaultdict(list)
+    for raw in logs:
+        it = _normalize_log_item(dict(raw))
+        cat = (it.get("category") or "").strip()
         lab = (it.get("label") or "").strip()
-        sc  = it.get("score")
-        if isinstance(sc, (int, float)) and lab:
-            avg_score_by_label[lab].append(float(sc))
+        if cat and lab in VALENCE_MAP:
+            bucket[cat].append(VALENCE_MAP[lab])
 
-    avg_txt = ", ".join([f"{k}:{sum(v)/len(v):.2f}" for k, v in avg_score_by_label.items() if v])
-    top_label = by_label.most_common(1)[0][0] if by_label else "알수없음"
-    top_cat   = by_cat.most_common(1)[0][0] if by_cat else "알수없음"
-    top_place = by_place.most_common(1)[0][0] if by_place else "알수없음"
+    aggs: List[PlaceValence] = []
+    for k, v in bucket.items():
+        if len(v) >= 2:
+            aggs.append(PlaceValence(placeCat=k, avgValence=round(sum(v)/len(v), 3)))
+    aggs.sort(key=lambda x: abs(x.avgValence), reverse=True)
+    return aggs[:top_n]
 
-    lines = [
-        f"[주간 인사이트] 총 {n}건 로그를 분석했습니다.",
-        f"- 주요 감정: {top_label} (분포: {dict(by_label)})",
-        f"- 많이 방문한 카테고리: {top_cat}",
-        f"- 자주 언급된 장소: {top_place}",
-    ]
-    if avg_txt:
-        lines.append(f"- 감정별 평균 점수: {avg_txt}")
-    lines.append("짧은 제안: 긍정이 많은 장소/시간대를 저장하고, 부정 감정이 잦은 환경은 회피 전략을 세워보세요.")
-    return "\n".join(lines)
+def generate_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
+    # ① 데이터 부족
+    if not vals:
+        return "지난주엔 데이터가 부족해 특별한 패턴을 찾지 못했어요."
+    # ② GPT 미설정/오류 대비
+    if not openai.api_key:
+        return ""
+
+    emo_msg = ", ".join([f"{k} {v}회" for k, v in counts.items() if v])
+    place_msg = ", ".join([f"{p.placeCat}({p.avgValence:+.2f})" for p in vals[:3]])
+
+    prompt = (
+        "[지난주 감정 통계]\n\n"
+        f"장소별 평균 감정지수\n• {place_msg}\n\n"
+        f"감정 분포\n• {emo_msg}\n\n"
+        "[요청]\n"
+        "1️⃣ 데이터에서 사용자가 예상치 못했을 패턴 한 가지를 짚어 줘.\n"
+        "2️⃣ 그 의미를 따뜻하게 설명해 줘.\n"
+        "3️⃣ 감정 균형을 돕는 작은 행동 제안 1개 포함.\n"
+        "4️⃣ 150자 이내, '~해요/해보세요' 어미로 한 문장으로 답해 줘."
+    )
+    try:
+        chat = openai.chat.completions.create(
+            model=GPT_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_MSG},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=220,
+            temperature=0.65,
+        )
+        return (chat.choices[0].message.content or "").strip()[:150]
+    except Exception as e:
+        print("[GPT error]", e)
+        return ""  # 실패 시 빈 문자열
 
 # ────────────────────────────────────────────────────────────
 # DB helpers
@@ -202,7 +255,6 @@ async def save_emotion(memo_id: int, label: str, score: float):
 async def insight_insert_processing(user_id: int) -> int:
     """
     InsightEntity에 'PROCESSING' 상태의 레코드를 먼저 만들고 PK를 반환.
-    중간 과정을 프론트에서 조회 가능.
     """
     tbl = _safe_tbl(INSIGHT_TABLE)
     async with engine.begin() as conn:
@@ -213,7 +265,6 @@ async def insight_insert_processing(user_id: int) -> int:
             ),
             {"uid": user_id, "content": "인사이트 생성 중...", "status": INSIGHT_STATUS_PROC},
         )
-        # MySQL: 같은 세션에서 LAST_INSERT_ID()로 PK 회수
         new_id = await conn.scalar(text("SELECT LAST_INSERT_ID()"))
         return int(new_id or 0)
 
@@ -304,13 +355,17 @@ async def run_insight_worker():
                     if user_id is None or not isinstance(logs, list):
                         raise ValueError("payload must have userId and logs[]")
 
-                    # 1) 중간상태 row 생성 (PROCESSING)
+                    # 1) PROCESSING 행 미리 생성
                     insight_row_id = await insight_insert_processing(int(user_id))
 
-                    # 2) 요약 생성
-                    summary = _summarize_logs(logs)
+                    # 2) 통계 계산
+                    counts = emotion_counts(logs)
+                    vals = place_valences(logs)
 
-                    # 3) 완료 업데이트
+                    # 3) GPT 요약 생성
+                    summary = generate_summary(vals, counts)  # ← 너가 원한 함수 사용!
+
+                    # 4) 완료 업데이트
                     await insight_update_done(insight_row_id, summary)
                     log.info(
                         "[insight] saved insight_id=%s user_id=%s entries=%s status=%s",
@@ -324,7 +379,6 @@ async def run_insight_worker():
                             await insight_update_failed(insight_row_id, f"{type(e).__name__}: {e}")
                         except Exception:
                             log.exception("[insight] failed to update FAIL status.")
-                    # 실패 메시지는 DLQ로 보내고 재처리하지 않음
                     await msg.reject(requeue=False)
 
 # ────────────────────────────────────────────────────────────
