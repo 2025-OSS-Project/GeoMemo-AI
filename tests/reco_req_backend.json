@@ -1,0 +1,26 @@
+{
+  "requestId": "req-backend-001",
+  "userId": 12,
+  "top": 7,
+  "candidates": [
+    { "placeId": 610, "name": "힐링 카페",   "category": "카페",   "latitude": 37.5501, "longitude": 127.1400 },
+    { "placeId": 501, "name": "행복한 공원", "category": "공원",   "latitude": 37.5663, "longitude": 126.9779 },
+    { "placeId": 630, "name": "현대미술관",  "category": "미술관", "latitude": 37.5790, "longitude": 126.9800 },
+    { "placeId": 670, "name": "반짝 공예공방","category": "액티비티","latitude": 37.5667, "longitude": 126.9910 },
+    { "placeId": 680, "name": "블루 테마파크","category": "놀이공원","latitude": 37.5084, "longitude": 126.8970 }
+  ],
+  "context": {
+    "recentEmotion": { "label": "슬픔", "score": 0.92 },
+    "favCategories": { "카페": 6, "공원": 5, "미술관": 2 },
+    "scrapPlaceIds": [610, 670, 680],
+    "followedUserIds": [23, 45, 78],
+    "placeSignals": [
+      { "placeId": 610, "posRatio": 0.91, "followedPositiveCount": 3 },
+      { "placeId": 670, "posRatio": 0.89, "followedPositiveCount": 2 },
+      { "placeId": 680, "posRatio": 0.93, "followedPositiveCount": 2 },
+      { "placeId": 501, "posRatio": 0.83, "followedPositiveCount": 0 },
+      { "placeId": 630, "posRatio": 0.79, "followedPositiveCount": 1 }
+    ]
+  },
+  "debug": true
+}
