@@ -1,18 +1,36 @@
-torch>=2.2.0
-transformers>=4.41.0
-accelerate
-numpy
-fastapi
-uvicorn[standard]
-tqdm
-pandas
-fastapi==0.111.0
+# --- Core config & typing ---
+python-dotenv>=1.0.1
 pydantic>=2.7,<3.0
-redis>=5.0
-openai~=1.30
-
 pydantic-settings>=2.2.1
-python-dotenv>=1.0.1   
-stomp.py>=8.1.0      # Amazon MQ(STOMP) 클라이언트
-pika
-aio_pika
+typing-extensions>=4.10.0
+packaging>=24.0
+
+# --- API server ---
+fastapi==0.111.0
+uvicorn[standard]>=0.30.0
+orjson>=3.10.0
+
+# --- OpenAI client ---
+openai>=1.30.0
+
+# --- ML / NLP ---
+torch>=2.2.0            # CPU 기준. (GPU면 CUDA 빌드로 교체)
+transformers>=4.55.0
+accelerate>=0.33.0
+numpy>=1.26.0
+pandas>=2.2.0
+tqdm>=4.66.0
+
+# --- RabbitMQ (AMQP) ---
+aio-pika>=9.4.1         # aiormq 포함. 버전 호환 위해 함께 명시
+aiormq>=6.8.0
+stomp.py>=8.1.0         # (Amazon MQ의 STOMP 사용 시)
+
+# --- Database (MySQL, Async) ---
+SQLAlchemy>=2.0.30
+aiomysql>=0.2.0
+pymysql>=1.1.0
+greenlet>=3.0.0
+
+# --- Cache / misc ---
+redis>=5.0.0
