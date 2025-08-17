@@ -1,26 +1,59 @@
-# ai/mq_recommender_worker.py
 from __future__ import annotations
-import os, json, time, asyncio
+import os, json, time, asyncio, logging, traceback
 from typing import Dict, List, Set, Optional, Any
 
 import aio_pika
-from aio_pika import IncomingMessage
+from aio_pika import IncomingMessage, DeliveryMode
+from aio_pika.exceptions import DeliveryError
 
 from ai.infra.mq_common import connect_channel, declare_queues, RES_QUEUE
 from ai.recommender.schema import Place, to_label_idx
 from ai.recommender.recommender import recommend_top_n
 
+# ─────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+log = logging.getLogger("reco-worker")
+
+def to_jsonable(x):
+    """JSON 직렬화 안전 변환."""
+    if x is None or isinstance(x, (str, int, float, bool)):
+        return x
+    if isinstance(x, dict):
+        return {k: to_jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, set)):
+        return [to_jsonable(i) for i in x]
+    # pydantic/데이터클래스 호환
+    for attr in ("model_dump", "dict"):
+        if hasattr(x, attr):
+            try:
+                return to_jsonable(getattr(x, attr)())
+            except Exception:
+                pass
+    if hasattr(x, "__dict__"):
+        try:
+            return to_jsonable(vars(x))
+        except Exception:
+            pass
+    return str(x)
+
 # ---------- 결과 publish ----------
-async def publish_result(ch: aio_pika.Channel, body: dict, correlation_id: Optional[str]):
-    await ch.default_exchange.publish(
-        aio_pika.Message(
-            body=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            content_type="application/json",
-            correlation_id=correlation_id,
-            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-        ),
-        routing_key=RES_QUEUE,
+async def publish_result(ch: aio_pika.Channel, body: dict, target_queue: str, correlation_id: Optional[str]):
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    msg = aio_pika.Message(
+        body=payload,
+        content_type="application/json",
+        correlation_id=correlation_id,
+        delivery_mode=DeliveryMode.PERSISTENT,
     )
+    # mandatory=True → 라우팅 실패 시 DeliveryError 발생
+    await ch.default_exchange.publish(msg, routing_key=target_queue, mandatory=True)
+    log.info(f"[publish] ok → queue='{target_queue}', corr='{correlation_id}', bytes={len(payload)}")
 
 # ---------- 요청 파싱 ----------
 def parse_request(payload: Dict[str, Any]):
@@ -29,7 +62,6 @@ def parse_request(payload: Dict[str, Any]):
     debug = bool(payload.get("debug", False))
 
     candidates = [Place(**p) for p in payload["candidates"]]
-
     ctx = payload.get("context", {}) or {}
 
     r = ctx.get("recentEmotion")
@@ -66,17 +98,32 @@ def parse_request(payload: Dict[str, Any]):
         "scrap_place_ids": scrap_place_ids,
         "pos_ratio": pos_ratio,
         "followed_pos_count": followed_pos_count,
+        "cand_count": len(candidates),
     }
 
 # ---------- 소비 콜백 ----------
 async def on_message(msg: IncomingMessage, ch: aio_pika.Channel):
     started = time.time()
     payload: Dict[str, Any] = {}
+    res: Dict[str, Any] = {}
+    target_queue = msg.reply_to or os.getenv("RECO_RES_QUEUE", RES_QUEUE)
+
+    log.info(
+        f"[recv] corr='{msg.correlation_id}', reply_to='{msg.reply_to}', "
+        f"bytes={len(msg.body) if msg.body else 0}"
+    )
+
     try:
         payload = json.loads(msg.body)
         req_id = payload.get("requestId") or msg.correlation_id
 
         parsed = parse_request(payload)
+        log.info(
+            f"[parse] userId={parsed['user_id']}, cand={parsed['cand_count']}, "
+            f"top={parsed['top']}, debug={parsed['debug']}, "
+            f"recent_idx={parsed['recent_idx']}, recent_score={parsed['recent_score']}"
+        )
+
         items = recommend_top_n(
             user_id=parsed["user_id"],
             candidate_places=parsed["candidates"],
@@ -90,33 +137,68 @@ async def on_message(msg: IncomingMessage, ch: aio_pika.Channel):
             debug=parsed["debug"],
         )
 
-        # ★ 결과에 userId 포함
+        # JSON 직렬화 안전화
+        items = to_jsonable(items)
+
         res = {
             "requestId": req_id,
             "userId": parsed["user_id"],
             "status": "ok",
             "items": items,
-            "meta": { "model": "reco-v1.1", "elapsedMs": int((time.time()-started)*1000) }
+            "meta": {
+                "model": "reco-v1.1",
+                "elapsedMs": int((time.time() - started) * 1000),
+            },
         }
 
     except Exception as e:
+        # 여기서도 에러 원인을 상세 로그로 남김
+        log.error(f"[error] {type(e).__name__}: {e}")
+        log.debug(traceback.format_exc())
+        req_id = (payload.get("requestId") if isinstance(payload, dict) else None) or msg.correlation_id
         res = {
-            "requestId": payload.get("requestId") if isinstance(payload, dict) else None,
+            "requestId": req_id,
             "userId": payload.get("userId") if isinstance(payload, dict) else None,
             "status": "error",
             "error": f"{type(e).__name__}: {e}",
-            "meta": { "model": "reco-v1.1" }
+            "meta": {"model": "reco-v1.1"},
         }
 
-    await publish_result(ch, res, msg.correlation_id or res.get("requestId"))
-    await msg.ack()
+    # publish → ack/nack
+    try:
+        await publish_result(ch, res, target_queue, msg.correlation_id or res.get("requestId"))
+        await msg.ack()
+        log.info(f"[ack] corr='{msg.correlation_id}' done")
+    except DeliveryError as de:
+        # 큐 미존재/라우팅 실패 등
+        log.error(f"[publish-fail] queue='{target_queue}' corr='{msg.correlation_id}' → {de}. NACK requeue")
+        await msg.nack(requeue=True)
+    except Exception as e:
+        log.error(f"[publish-fail] unexpected: {type(e).__name__}: {e}. NACK requeue")
+        log.debug(traceback.format_exc())
+        await msg.nack(requeue=True)
 
 # ---------- 진입점 ----------
 async def main():
     conn, ch = await connect_channel()
+
+    # 요청 큐 선언 (기존 함수 사용)
     req_q = await declare_queues(ch)
-    print("[*] Recommender worker started. Waiting for messages…")
+
+    # 응답 큐도 반드시 보장
+    res_q_name_env = os.getenv("RECO_RES_QUEUE", RES_QUEUE)
+    await ch.declare_queue(res_q_name_env, durable=True)
+    log.info(f"[startup] reqQueue='{req_q.name}', resQueue='{res_q_name_env}', RES_QUEUE='{RES_QUEUE}'")
+
+    # prefetch(선택) — 과도한 소비 방지
+    try:
+        await ch.set_qos(prefetch_count=int(os.getenv("RECO_PREFETCH", "8")))
+    except Exception:
+        pass
+
+    log.info("[*] Recommender worker started. Waiting for messages…")
     await req_q.consume(lambda m: on_message(m, ch))
+
     try:
         await asyncio.Future()
     finally:

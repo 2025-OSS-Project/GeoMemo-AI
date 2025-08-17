@@ -44,9 +44,6 @@ INSIGHT_PREFETCH    = int(os.getenv("INSIGHT_PREFETCH", "16"))
 INSIGHT_TTL_MS      = int(os.getenv("INSIGHT_TTL_MS")) if os.getenv("INSIGHT_TTL_MS") else None
 INSIGHT_TABLE       = os.getenv("INSIGHT_TABLE", "InsightEntity")
 INSIGHT_STATUS_DONE = os.getenv("INSIGHT_STATUS", "DONE")
-INSIGHT_STATUS_PROC = os.getenv("INSIGHT_STATUS_PROCESSING", "PROCESSING")
-INSIGHT_STATUS_FAIL = os.getenv("INSIGHT_STATUS_FAILED", "FAILED")
-INSIGHT_PK_COL      = os.getenv("INSIGHT_PK_COL", "insight_id")  # 스키마에 따라 id/insight_id
 
 # GPT
 openai.api_key = os.getenv("OPENAI_API_KEY", "")
@@ -181,7 +178,7 @@ class PlaceValence:
 
 def place_valences(logs: List[Dict[str, Any]], top_n: int = 5) -> List[PlaceValence]:
     """
-    장소(category)별 valence 평균. 동일 카테고리 2건 이상일 때만 채택(노이즈 완화).
+    장소(category)별 valence 평균. 동일 카테고리 **1건 이상**이면 채택.
     """
     bucket: Dict[str, List[float]] = defaultdict(list)
     for raw in logs:
@@ -193,20 +190,49 @@ def place_valences(logs: List[Dict[str, Any]], top_n: int = 5) -> List[PlaceVale
 
     aggs: List[PlaceValence] = []
     for k, v in bucket.items():
-        if len(v) >= 2:
+        if len(v) >= 1:  # 최소 1건
             aggs.append(PlaceValence(placeCat=k, avgValence=round(sum(v)/len(v), 3)))
     aggs.sort(key=lambda x: abs(x.avgValence), reverse=True)
     return aggs[:top_n]
 
+def _format_counts_for_log(counts: Dict[str, int]) -> str:
+    return ", ".join([f"{k}:{v}" for k, v in counts.items()]) or "empty"
+
+def _vals_as_json(vals: List[PlaceValence]) -> str:
+    try:
+        return json.dumps([{"placeCat": v.placeCat, "avgValence": v.avgValence} for v in vals], ensure_ascii=False)
+    except Exception:
+        return str(vals)
+
+def _fallback_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
+    # 아주 짧은 한 줄 대체문. 150자 이내 보장.
+    top_place = vals[0].placeCat if vals else None
+    top_val = vals[0].avgValence if vals else 0.0
+    top_emo = ""
+    if counts:
+        try:
+            top_emo = max(counts.items(), key=lambda kv: kv[1])[0]
+        except Exception:
+            top_emo = ""
+    if top_place:
+        polarity = "높아요" if top_val > 0 else "낮아요"
+        action = "그 시간을 더 자주 만들어 보세요" if top_val > 0 else "짧은 휴식이나 산책으로 환기해보세요"
+        txt = f"{top_place}에서의 감정지수가 {polarity}. '{top_emo}' 경향을 살피며 작은 루틴을 만들면 좋아요. 오늘 10분 {('산책' if top_val<0 else '휴식')} 해보세요."
+    else:
+        txt = "이번 주 데이터가 적지만, 짧은 산책·수면 루틴을 꾸준히 만들면 감정 균형에 도움이 돼요. 오늘 10분만 실천해보세요."
+    return txt[:150]
+
 def generate_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
     """
-    집계 결과로 프롬프트를 만들고 GPT가 150자 이내 한 문장으로 응답.
-    빈/미설정 API키면 빈 문자열 반환.
+    집계 결과로 프롬프트 생성 → GPT 응답(150자 이내).
+    실패/미설정 시 빈 문자열 반환(상위에서 대체문 사용).
     """
     if not vals:
+        # 데이터 부족은 그대로 한 줄 안내문 리턴
         return "지난주엔 데이터가 부족해 특별한 패턴을 찾지 못했어요."
     if not openai.api_key:
-        log.warning("[insight] OPENAI_API_KEY 미설정 — 빈 문자열 저장됨.")
+        log.error("[insight] OPENAI_API_KEY missing. counts=%s, vals=%s",
+                  _format_counts_for_log(counts), _vals_as_json(vals))
         return ""
 
     emo_msg = ", ".join([f"{k} {v}회" for k, v in counts.items() if v])
@@ -222,26 +248,42 @@ def generate_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
         "3️⃣ 감정 균형을 돕는 작은 행동 제안 1개 포함.\n"
         "4️⃣ 150자 이내, '~해요/해보세요' 어미로 한 문장으로 답해 줘."
     )
-    try:
-        chat = openai.chat.completions.create(
-            model=GPT_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_MSG},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=220,
-            temperature=0.65,
-        )
-        out = (chat.choices[0].message.content or "").strip().replace("\n", " ")
-        out = out[:150]
-        log.info("[insight] GPT summary generated (len=%s): %s", len(out), out)
-        return out
-    except Exception:
-        log.exception("[insight] GPT error")
-        return ""
+
+    # 디버그용: 프롬프트 스냅샷
+    log.debug("[insight] prompt preview: %s", prompt.replace("\n", " ")[:300])
+
+    # 간단 재시도(최대 2회)
+    last_err = None
+    for attempt in range(1, 3):
+        try:
+            chat = openai.chat.completions.create(
+                model=GPT_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_MSG},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=220,
+                temperature=0.65,
+            )
+            out = (chat.choices[0].message.content or "").strip().replace("\n", " ")
+            out = out[:150]
+            if not out:
+                log.warning("[insight] empty summary from GPT (attempt=%s). counts=%s, vals=%s",
+                            attempt, _format_counts_for_log(counts), _vals_as_json(vals))
+            else:
+                log.info("[insight] GPT summary OK (len=%s): %s", len(out), out)
+                return out
+        except Exception as e:
+            last_err = e
+            log.exception("[insight] GPT call failed (attempt=%s)", attempt)
+
+    # 모든 시도 실패
+    log.error("[insight] GPT failed after retries. counts=%s, vals=%s, error=%s",
+              _format_counts_for_log(counts), _vals_as_json(vals), repr(last_err))
+    return ""
 
 # ────────────────────────────────────────────────────────────
-# DB helpers  (INSERT once → UPDATE same row)
+# DB helpers  (DONE 한 번만 INSERT)
 # ────────────────────────────────────────────────────────────
 async def save_emotion(memo_id: int, label: str, score: float):
     """EmotionEntity: UPDATE 없으면 INSERT."""
@@ -259,67 +301,18 @@ async def save_emotion(memo_id: int, label: str, score: float):
             params,
         )
 
-async def insight_get_or_create_processing(user_id: int) -> int:
+async def insight_insert_done(user_id: int, content: str):
     """
-    (1) 같은 사용자에 대해 PROCESSING 상태 레코드가 있으면 그 PK를 재사용.
-    (2) 없으면 새로 INSERT 후 PK 반환.
+    PROCESSING 없이 최종 결과만 INSERT (status=DONE).
     """
     tbl = _safe_tbl(INSIGHT_TABLE)
-    pk  = _safe_tbl(INSIGHT_PK_COL)
     async with engine.begin() as conn:
-        # 이미 있는 PROCESSING 행 탐색 (가장 최근 것)
-        row = await conn.execute(
-            text(
-                f"SELECT {pk} FROM {tbl} "
-                f"WHERE user_id=:uid AND status=:st "
-                f"ORDER BY createdAt DESC LIMIT 1"
-            ),
-            {"uid": user_id, "st": INSIGHT_STATUS_PROC},
-        )
-        found = row.first()
-        if found and found[0]:
-            iid = int(found[0])
-            log.info("[insight] reuse PROCESSING row: %s (user_id=%s)", iid, user_id)
-            return iid
-
-        # 없으면 새로 생성
         await conn.execute(
             text(
                 f"INSERT INTO {tbl} (user_id, content, status, createdAt) "
                 f"VALUES (:uid, :content, :status, CURRENT_TIMESTAMP)"
             ),
-            {"uid": user_id, "content": "인사이트 생성 중...", "status": INSIGHT_STATUS_PROC},
-        )
-        new_id = await conn.scalar(text("SELECT LAST_INSERT_ID()"))
-        iid = int(new_id or 0)
-        log.info("[insight] created PROCESSING row: %s (user_id=%s)", iid, user_id)
-        return iid
-
-async def insight_update_done(insight_id: int, content: str):
-    tbl = _safe_tbl(INSIGHT_TABLE)
-    pk  = _safe_tbl(INSIGHT_PK_COL)
-    async with engine.begin() as conn:
-        await conn.execute(
-            text(
-                f"UPDATE {tbl} SET content=:content, status=:status "
-                f"WHERE {pk}=:iid"
-            ),
-            {"content": content, "status": INSIGHT_STATUS_DONE, "iid": insight_id},
-        )
-
-async def insight_update_failed(insight_id: int, err_msg: str):
-    tbl = _safe_tbl(INSIGHT_TABLE)
-    pk  = _safe_tbl(INSIGHT_PK_COL)
-    safe_msg = (err_msg or "").strip()
-    if len(safe_msg) > 900:
-        safe_msg = safe_msg[:900] + "…"
-    async with engine.begin() as conn:
-        await conn.execute(
-            text(
-                f"UPDATE {tbl} SET content=:content, status=:status "
-                f"WHERE {pk}=:iid"
-            ),
-            {"content": f"[오류] {safe_msg}", "status": INSIGHT_STATUS_FAIL, "iid": insight_id},
+            {"uid": user_id, "content": content, "status": INSIGHT_STATUS_DONE},
         )
 
 # ────────────────────────────────────────────────────────────
@@ -376,7 +369,6 @@ async def run_insight_worker():
     async with q.iterator() as it:
         async for msg in it:
             async with msg.process(ignore_processed=True):
-                insight_row_id: Optional[int] = None
                 try:
                     payload = json.loads(msg.body.decode("utf-8"))
                     user_id = _pick(payload, "userId", "user_id")
@@ -384,30 +376,27 @@ async def run_insight_worker():
                     if user_id is None or not isinstance(logs, list):
                         raise ValueError("payload must have userId and logs[]")
 
-                    # 1) PROCESSING 행 재사용 or 생성
-                    insight_row_id = await insight_get_or_create_processing(int(user_id))
-
-                    # 2) 통계 계산
+                    # 1) 통계 계산
                     counts = emotion_counts(logs)
                     vals = place_valences(logs)
 
-                    # 3) GPT 요약 생성 (집계 문자열 X, 요약 한 문장만)
+                    # 2) GPT 요약 생성
                     summary = generate_summary(vals, counts)
 
-                    # 4) 완료 업데이트 (같은 행 교체)
-                    await insight_update_done(insight_row_id, summary)
-                    log.info(
-                        "[insight] updated DONE insight_id=%s user_id=%s entries=%s",
-                        insight_row_id, user_id, len(logs)
-                    )
+                    # 3) 요약이 비면 대체문 생성 + 경고 로그
+                    if not summary.strip():
+                        log.warning(
+                            "[insight] summary empty -> using fallback. counts=%s, vals=%s",
+                            _format_counts_for_log(counts), _vals_as_json(vals)
+                        )
+                        summary = _fallback_summary(vals, counts)
 
-                except Exception as e:
+                    # 4) 최종 결과만 INSERT (DONE)
+                    await insight_insert_done(int(user_id), summary)
+                    log.info("[insight] inserted DONE for user_id=%s entries=%s", user_id, len(logs))
+
+                except Exception:
                     log.exception("[insight] processing failed.")
-                    if insight_row_id:
-                        try:
-                            await insight_update_failed(insight_row_id, f"{type(e).__name__}: {e}")
-                        except Exception:
-                            log.exception("[insight] failed to update FAIL status.")
                     await msg.reject(requeue=False)
 
 # ────────────────────────────────────────────────────────────

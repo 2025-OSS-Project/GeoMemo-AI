@@ -53,10 +53,21 @@ def main():
     os.environ.setdefault("INSIGHT_REQ_QUEUE", os.getenv("MQ_QUEUE", "insight.req"))
     os.environ.setdefault("EMOTION_REQ_QUEUE", os.getenv("EMOTION_REQ_QUEUE", "emotion.req"))
 
+    # (추천) 요청/응답 큐명도 환경변수로 제어 가능하게
+    os.environ.setdefault("RECO_REQ_QUEUE", os.getenv("RECO_REQ_QUEUE", "reco.req"))
+    os.environ.setdefault("RECO_RES_QUEUE", os.getenv("RECO_RES_QUEUE", "reco.res"))
+
+    print("[env] AMQP_URL         =", os.getenv("AMQP_URL"))
+    print("[env] RECO_REQ_QUEUE   =", os.getenv("RECO_REQ_QUEUE"))
+    print("[env] RECO_RES_QUEUE   =", os.getenv("RECO_RES_QUEUE"))
+    print("[env] INSIGHT_REQ_QUEUE=", os.getenv("INSIGHT_REQ_QUEUE"))
+    print("[env] EMOTION_REQ_QUEUE=", os.getenv("EMOTION_REQ_QUEUE"))
+    print("[env] LOG_LEVEL        =", os.getenv("LOG_LEVEL", "INFO"))
+
     # 추천 워커 모듈 경로 자동 탐색
     reco_mods = [
-        "ai.recommender.mq_recommender_worker",  # ai/recommender/mq_recommender_worker.py
-        "ai.mq_recommender_worker",              # ai/mq_recommender_worker.py
+        "ai.recommender.mq_recommender_worker",
+        "ai.mq_recommender_worker",
     ]
     reco_mod = next((m for m in reco_mods if exists_module(m)), None)
     if not reco_mod:
@@ -67,7 +78,7 @@ def main():
     procs = [
         ("cache",       [py, "-m", "ai.infra.mq_consumer"]),
         ("recommender", [py, "-m", reco_mod]),
-        ("emo+insight", [py, "-m", "ai.infra.mq_emotion"]),  # 감정+인사이트 통합
+        ("emo+insight", [py, "-m", "ai.infra.mq_emotion"]),
     ]
 
     env = os.environ.copy()
