@@ -42,6 +42,17 @@ def to_jsonable(x):
             pass
     return str(x)
 
+def safe_to_label_idx(label: Optional[str]) -> Optional[int]:
+    """라벨을 추천용 인덱스로 안전 변환. 모르면 None(무시)."""
+    if not label:
+        return None
+    try:
+        return to_label_idx(label)
+    except Exception:
+        # 프로젝트 감정 라벨(기쁨/놀람/분노/불안/상처/슬픔) 외의 값(예: 긍정/중립)은 무시
+        log.debug(f"[recentEmotion] unknown label ignored: {label}")
+        return None
+
 # ---------- 결과 publish ----------
 async def publish_result(ch: aio_pika.Channel, body: dict, target_queue: str, correlation_id: Optional[str]):
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -61,19 +72,41 @@ def parse_request(payload: Dict[str, Any]):
     top = int(payload.get("top", 5))
     debug = bool(payload.get("debug", False))
 
-    candidates = [Place(**p) for p in payload["candidates"]]
+    # 후보는 이미 placeId/name/category/latitude/longitude 로 들어옴
+    candidates = []
+    for i, p in enumerate(payload.get("candidates") or []):
+        try:
+            candidates.append(Place(**p))
+        except Exception as e:
+            log.warning(f"[candidate-skip] idx={i} keys={list(p.keys())} error={type(e).__name__}: {e}")
+
     ctx = payload.get("context", {}) or {}
 
+    # recentEmotion: dict 또는 list 모두 지원
     r = ctx.get("recentEmotion")
-    if r:
-        recent_idx = to_label_idx(r.get("label"))
-        recent_score = float(r.get("score") or 0.0)
-    else:
-        recent_idx, recent_score = None, 0.0
+    recent_idx: Optional[int] = None
+    recent_score: float = 0.0
 
+    if isinstance(r, dict):
+        recent_idx = safe_to_label_idx(r.get("label"))
+        recent_score = float(r.get("score") or 0.0)
+    elif isinstance(r, list) and r:
+        # 점수가 가장 높은 항목을 사용
+        try:
+            best = max(r, key=lambda x: float(x.get("score") or 0.0))
+        except Exception:
+            best = r[0]
+        recent_idx = safe_to_label_idx(best.get("label"))
+        recent_score = float(best.get("score") or 0.0)
+    elif r is not None:
+        log.debug(f"[recentEmotion] unsupported type: {type(r).__name__}")
+
+    # 선호 카테고리/스크랩/팔로우 정보
     fav_categories: Dict[str, int] = dict(ctx.get("favCategories") or {})
     scrap_place_ids: Set[int] = set(ctx.get("scrapPlaceIds") or [])
+    # followedUserIds 는 현재 로직에서 직접 사용하지 않음(장소별 followedPositiveCount 로 반영됨)
 
+    # 장소 시그널
     pos_ratio: Dict[int, float] = {}
     followed_pos_count: Dict[int, int] = {}
     for ps in (ctx.get("placeSignals") or []):
@@ -83,7 +116,7 @@ def parse_request(payload: Dict[str, Any]):
         if "followedPositiveCount" in ps and ps["followedPositiveCount"] is not None:
             followed_pos_count[pid] = int(ps["followedPositiveCount"])
 
-    cand_ids = {p.placeId for p in candidates}
+    cand_ids = {getattr(p, "placeId") for p in candidates}
     pos_ratio = {pid: pos_ratio.get(pid, 0.5) for pid in cand_ids}
     followed_pos_count = {pid: followed_pos_count.get(pid, 0) for pid in cand_ids}
 

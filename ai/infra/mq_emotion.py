@@ -216,7 +216,6 @@ def _fallback_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
             top_emo = ""
     if top_place:
         polarity = "높아요" if top_val > 0 else "낮아요"
-        action = "그 시간을 더 자주 만들어 보세요" if top_val > 0 else "짧은 휴식이나 산책으로 환기해보세요"
         txt = f"{top_place}에서의 감정지수가 {polarity}. '{top_emo}' 경향을 살피며 작은 루틴을 만들면 좋아요. 오늘 10분 {('산책' if top_val<0 else '휴식')} 해보세요."
     else:
         txt = "이번 주 데이터가 적지만, 짧은 산책·수면 루틴을 꾸준히 만들면 감정 균형에 도움이 돼요. 오늘 10분만 실천해보세요."
@@ -256,15 +255,37 @@ def generate_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
     last_err = None
     for attempt in range(1, 3):
         try:
-            chat = openai.chat.completions.create(
-                model=GPT_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_MSG},
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=220,
-                temperature=0.65,
-            )
+            # 메시지 구성
+            messages = [
+                {"role": "system", "content": SYSTEM_MSG},
+                {"role": "user", "content": prompt},
+            ]
+
+            # 모델/파라미터 구성 (신·구 API 호환)
+            model_name = os.getenv("GPT_MODEL", GPT_MODEL)
+            params: Dict[str, Any] = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.6")),
+                "top_p": 1.0,
+            }
+            max_tok = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
+            if any(x in model_name for x in ["gpt-5", "o4-mini", "4o-mini"]):
+                params["max_completion_tokens"] = max_tok
+            else:
+                params["max_tokens"] = max_tok
+
+            try:
+                chat = openai.chat.completions.create(**params)
+            except openai.BadRequestError as e:
+                # 파라미터 호환 재시도: 모델이 다른 키만 지원할 때
+                if "max_tokens" in str(e) and "max_completion_tokens" in str(e):
+                    params.pop("max_tokens", None)
+                    params["max_completion_tokens"] = max_tok
+                    chat = openai.chat.completions.create(**params)
+                else:
+                    raise
+
             out = (chat.choices[0].message.content or "").strip().replace("\n", " ")
             out = out[:150]
             if not out:
