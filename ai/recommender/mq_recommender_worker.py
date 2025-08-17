@@ -5,6 +5,7 @@ from typing import Dict, List, Set, Optional, Any
 import aio_pika
 from aio_pika import IncomingMessage, DeliveryMode
 from aio_pika.exceptions import DeliveryError
+from aiormq.exceptions import ChannelPreconditionFailed
 
 from ai.infra.mq_common import connect_channel, declare_queues, RES_QUEUE
 from ai.recommender.schema import Place, to_label_idx
@@ -28,7 +29,6 @@ def to_jsonable(x):
         return {k: to_jsonable(v) for k, v in x.items()}
     if isinstance(x, (list, tuple, set)):
         return [to_jsonable(i) for i in x]
-    # pydantic/데이터클래스 호환
     for attr in ("model_dump", "dict"):
         if hasattr(x, attr):
             try:
@@ -51,7 +51,7 @@ async def publish_result(ch: aio_pika.Channel, body: dict, target_queue: str, co
         correlation_id=correlation_id,
         delivery_mode=DeliveryMode.PERSISTENT,
     )
-    # mandatory=True → 라우팅 실패 시 DeliveryError 발생
+    # mandatory=True → 라우팅 실패 시 DeliveryError
     await ch.default_exchange.publish(msg, routing_key=target_queue, mandatory=True)
     log.info(f"[publish] ok → queue='{target_queue}', corr='{correlation_id}', bytes={len(payload)}")
 
@@ -106,6 +106,8 @@ async def on_message(msg: IncomingMessage, ch: aio_pika.Channel):
     started = time.time()
     payload: Dict[str, Any] = {}
     res: Dict[str, Any] = {}
+
+    # reply_to 우선, 없으면 환경변수/상수 RES_QUEUE
     target_queue = msg.reply_to or os.getenv("RECO_RES_QUEUE", RES_QUEUE)
 
     log.info(
@@ -137,7 +139,6 @@ async def on_message(msg: IncomingMessage, ch: aio_pika.Channel):
             debug=parsed["debug"],
         )
 
-        # JSON 직렬화 안전화
         items = to_jsonable(items)
 
         res = {
@@ -152,7 +153,6 @@ async def on_message(msg: IncomingMessage, ch: aio_pika.Channel):
         }
 
     except Exception as e:
-        # 여기서도 에러 원인을 상세 로그로 남김
         log.error(f"[error] {type(e).__name__}: {e}")
         log.debug(traceback.format_exc())
         req_id = (payload.get("requestId") if isinstance(payload, dict) else None) or msg.correlation_id
@@ -164,13 +164,11 @@ async def on_message(msg: IncomingMessage, ch: aio_pika.Channel):
             "meta": {"model": "reco-v1.1"},
         }
 
-    # publish → ack/nack
     try:
         await publish_result(ch, res, target_queue, msg.correlation_id or res.get("requestId"))
         await msg.ack()
         log.info(f"[ack] corr='{msg.correlation_id}' done")
     except DeliveryError as de:
-        # 큐 미존재/라우팅 실패 등
         log.error(f"[publish-fail] queue='{target_queue}' corr='{msg.correlation_id}' → {de}. NACK requeue")
         await msg.nack(requeue=True)
     except Exception as e:
@@ -182,21 +180,36 @@ async def on_message(msg: IncomingMessage, ch: aio_pika.Channel):
 async def main():
     conn, ch = await connect_channel()
 
-    # 요청 큐 선언 (기존 함수 사용)
+    # 요청 큐 선언 (타입까지 맞춤)
     req_q = await declare_queues(ch)
 
-    # 응답 큐도 반드시 보장
+    # ---- 응답 큐 보장 (reply_to 없는 fallback일 때만) ----
     res_q_name_env = os.getenv("RECO_RES_QUEUE", RES_QUEUE)
-    await ch.declare_queue(res_q_name_env, durable=True)
-    log.info(f"[startup] reqQueue='{req_q.name}', resQueue='{res_q_name_env}', RES_QUEUE='{RES_QUEUE}'")
+    skip_res_declare = os.getenv("RECO_SKIP_RES_DECLARE", "0") == "1"
+    if not skip_res_declare:
+        res_q_type = os.getenv("RECO_RES_QUEUE_TYPE", os.getenv("MQ_QUEUE_TYPE", "quorum")).strip().lower()
+        res_args = {"x-queue-type": res_q_type} if res_q_type else None
+        try:
+            await ch.declare_queue(res_q_name_env, durable=True, arguments=res_args)
+            log.info(f"[startup] resQueue declared name='{res_q_name_env}' type='{res_q_type}'")
+        except ChannelPreconditionFailed as e:
+            log.error(f"[startup] RES queue precondition failed: {e}. "
+                      f"코드/ENV의 큐 타입이 브로커에 이미 생성된 큐 타입과 다릅니다. "
+                      f"운영 정책과 일치시키세요.")
+            raise
+    else:
+        log.info(f"[startup] skip declaring resQueue (RECO_SKIP_RES_DECLARE=1)")
 
-    # prefetch(선택) — 과도한 소비 방지
+    # prefetch(선택)
     try:
         await ch.set_qos(prefetch_count=int(os.getenv("RECO_PREFETCH", "8")))
     except Exception:
         pass
 
-    log.info("[*] Recommender worker started. Waiting for messages…")
+    log.info(f"[*] Recommender worker started. Waiting for messages… reqQueue='{req_q.name}', "
+             f"resQueue='{res_q_name_env}', queueType='{os.getenv('MQ_QUEUE_TYPE','quorum')}', "
+             f"skipResDeclare={skip_res_declare}")
+
     await req_q.consume(lambda m: on_message(m, ch))
 
     try:
