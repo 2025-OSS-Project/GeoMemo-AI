@@ -38,39 +38,37 @@ GeoMemo의 **AI 모듈** 레포지토리입니다. (감정 분석 · 개인화 �
 
 ## 🧱 아키텍처
 
+
 ```mermaid
 flowchart LR
-  subgraph Backend
-    B1[API 서버]
+  subgraph Backend["Backend"]
+    B1["API 서버"]
   end
 
-  subgraph MQ[(Amazon MQ / RabbitMQ)]
-    QR[(reco.req)]:::q --- QRES[(reco.res)]:::q
-    QE[(emotion.req)]:::q
-    QI[(insight.req)]:::q
-    EX{{geomemo.events (topic exchange)}}:::ex
+  subgraph MQ["Amazon MQ / RabbitMQ"]
+    QR[("reco.req")]:::q
+    QRES[("reco.res")]:::q
+    QE[("emotion.req")]:::q
+    QI[("insight.req")]:::q
+    EX["geomemo.events<br/>(topic exchange)"]:::ex
   end
 
-  subgraph AI[GeoMemo-AI]
-    RW[Recommender Worker
-(ai/recommender/mq_recommender_worker.py)]:::svc
-    EW[Emotion Worker
-(ai/infra/mq_emotion.py)]:::svc
-    IW[Insight Worker
-(ai/infra/mq_emotion.py)]:::svc
-    EC[Events Consumer (캐시)
-(ai/infra/mq_consumer.py)]:::svc
+  subgraph AI["GeoMemo-AI"]
+    RW["Recommender Worker<br/>ai/recommender/mq_recommender_worker.py"]:::svc
+    EW["Emotion Worker<br/>ai/infra/mq_emotion.py"]:::svc
+    IW["Insight Worker<br/>ai/infra/mq_emotion.py"]:::svc
+    EC["Events Consumer (캐시)<br/>ai/infra/mq_consumer.py"]:::svc
   end
 
-  B1 -- 후보/컨텍스트 publish --> QR --> RW --> QRES --> B1
-  B1 -- 메모 텍스트 publish --> QE --> EW
-  B1 -- 주간 로그 publish --> QI --> IW
-  B1 -. topic bind .-> EX
-  EX --> EC
+  B1 -->|후보/컨텍스트 publish| QR --> RW --> QRES --> B1
+  B1 -->|메모 텍스트 publish| QE --> EW
+  B1 -->|주간 로그 publish| QI --> IW
+  B1 -. topic bind .-> EX --> EC
 
-  classDef q fill:#fff8;
-  classDef svc fill:#f6ff;
-  classDef ex fill:#eef;
+  classDef q fill:#FFF8DC,stroke:#E6C200,color:#333;
+  classDef svc fill:#F0FFF0,stroke:#2E8B57,color:#333;
+  classDef ex fill:#EEF2FF,stroke:#4C6EF5,color:#333;
+
 ```
 
 ---
