@@ -39,16 +39,14 @@ EMOTION_TTL_MS    = int(os.getenv("EMOTION_TTL_MS")) if os.getenv("EMOTION_TTL_M
 EMOTION_TABLE     = os.getenv("EMOTION_TABLE", "EmotionEntity")
 
 # Insight
-INSIGHT_REQ_QUEUE   = os.getenv("INSIGHT_REQ_QUEUE", os.getenv("MQ_QUEUE", "insight.req"))
-INSIGHT_PREFETCH    = int(os.getenv("INSIGHT_PREFETCH", "16"))
-INSIGHT_TTL_MS      = int(os.getenv("INSIGHT_TTL_MS")) if os.getenv("INSIGHT_TTL_MS") else None
-INSIGHT_TABLE       = os.getenv("INSIGHT_TABLE", "InsightEntity")
-INSIGHT_STATUS_DONE = os.getenv("INSIGHT_STATUS", "DONE")
-
-# 중복 방지 시간창 (초 단위 우선)
-_ins_min = int(os.getenv("INSIGHT_DEDUPE_MINUTES", "3"))
-INSIGHT_DEDUPE_SECONDS = int(os.getenv("INSIGHT_DEDUPE_SECONDS", str(_ins_min * 60)))
-INSIGHT_DEDUPE_SECONDS = max(1, min(3600, INSIGHT_DEDUPE_SECONDS))  # 1s ~ 3600s 안전 가드
+INSIGHT_REQ_QUEUE      = os.getenv("INSIGHT_REQ_QUEUE", os.getenv("MQ_QUEUE", "insight.req"))
+INSIGHT_PREFETCH       = int(os.getenv("INSIGHT_PREFETCH", "16"))
+INSIGHT_TTL_MS         = int(os.getenv("INSIGHT_TTL_MS")) if os.getenv("INSIGHT_TTL_MS") else None
+INSIGHT_TABLE          = os.getenv("INSIGHT_TABLE", "InsightEntity")
+INSIGHT_STATUS_DONE    = os.getenv("INSIGHT_STATUS", "DONE")
+INSIGHT_STATUS_PENDING = os.getenv("INSIGHT_STATUS_PENDING", "PENDING")   # ← 백엔드 사전 INSERT 상태
+INSIGHT_PK_COL         = os.getenv("INSIGHT_PK_COL", "insight_id")        # 예: insight_id 또는 id
+INSIGHT_CREATED_AT_COL = os.getenv("INSIGHT_CREATED_AT_COL", "createdAt") # 예: createdAt 또는 created_at
 
 # GPT
 openai.api_key = os.getenv("OPENAI_API_KEY", "")
@@ -260,13 +258,11 @@ def generate_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
     last_err = None
     for attempt in range(1, 3):
         try:
-            # 메시지 구성
             messages = [
                 {"role": "system", "content": SYSTEM_MSG},
                 {"role": "user", "content": prompt},
             ]
 
-            # 모델/파라미터 구성 (신·구 API 호환)
             model_name = os.getenv("GPT_MODEL", GPT_MODEL)
             params: Dict[str, Any] = {
                 "model": model_name,
@@ -274,6 +270,8 @@ def generate_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
                 "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.6")),
                 "top_p": 1.0,
             }
+
+            # 최신/구형 모델 호환
             max_tok = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
             if any(x in model_name for x in ["gpt-5", "o4-mini", "4o-mini"]):
                 params["max_completion_tokens"] = max_tok
@@ -283,7 +281,7 @@ def generate_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
             try:
                 chat = openai.chat.completions.create(**params)
             except openai.BadRequestError as e:
-                # 파라미터 호환 재시도: 모델이 다른 키만 지원할 때
+                # 파라미터 호환 재시도
                 if "max_tokens" in str(e) and "max_completion_tokens" in str(e):
                     params.pop("max_tokens", None)
                     params["max_completion_tokens"] = max_tok
@@ -309,7 +307,7 @@ def generate_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
     return ""
 
 # ────────────────────────────────────────────────────────────
-# DB helpers  (DONE 한 번만 INSERT + 초 단위 중복 방지)
+# DB helpers
 # ────────────────────────────────────────────────────────────
 async def save_emotion(memo_id: int, label: str, score: float):
     """EmotionEntity: UPDATE 없으면 INSERT."""
@@ -327,44 +325,56 @@ async def save_emotion(memo_id: int, label: str, score: float):
             params,
         )
 
-async def insight_insert_done(user_id: int, content: str) -> bool:
+async def insight_update_pending_or_insert_done(user_id: int, content: str):
     """
-    PROCESSING 없이 최종 결과만 INSERT (status=DONE).
-    중복 방지: 최근 INSIGHT_DEDUPE_SECONDS 내 동일 (user_id, status, content) 존재 시 skip.
+    백엔드가 먼저 PENDING을 INSERT한다는 전제:
+      1) 해당 user_id의 최신 PENDING 1건을 찾아 content/상태를 DONE으로 UPDATE
+      2) 없으면 새로 INSERT(DONE)
+    컬럼명은 환경변수로 조정 가능:
+      - INSIGHT_PK_COL (기본: insight_id)
+      - INSIGHT_CREATED_AT_COL (기본: createdAt)
     """
     tbl = _safe_tbl(INSIGHT_TABLE)
-    window_sec = INSIGHT_DEDUPE_SECONDS
-    async with engine.begin() as conn:
-        # 최근 window_sec초 내 동일 내용이 있으면 skip
-        exists = await conn.scalar(
-            text(
-                f"""
-                SELECT 1
-                FROM {tbl}
-                WHERE user_id = :uid
-                  AND status   = :st
-                  AND content  = :content
-                  AND createdAt >= DATE_SUB(CURRENT_TIMESTAMP, INTERVAL {window_sec} SECOND)
-                LIMIT 1
-                """
-            ),
-            {"uid": user_id, "st": INSIGHT_STATUS_DONE, "content": content},
-        )
-        if exists:
-            log.warning(
-                "[insight] duplicate detected — skip insert (user_id=%s, window=%ss)",
-                user_id, window_sec
-            )
-            return False
+    pkcol = _safe_tbl(INSIGHT_PK_COL)
+    created_col = _safe_tbl(INSIGHT_CREATED_AT_COL)
 
+    async with engine.begin() as conn:
+        # 1) 최신 PENDING 한 건 조회
+        pending_row = None
+        try:
+            rs = await conn.execute(
+                text(
+                    f"SELECT {pkcol} FROM {tbl} "
+                    f"WHERE user_id=:uid AND status=:st "
+                    f"ORDER BY {created_col} DESC LIMIT 1"
+                ),
+                {"uid": user_id, "st": INSIGHT_STATUS_PENDING},
+            )
+            pending_row = rs.first()
+        except Exception:
+            log.exception("[insight] SELECT pending failed — fallback to INSERT DONE")
+
+        if pending_row and pending_row[0] is not None:
+            iid = int(pending_row[0])
+            await conn.execute(
+                text(
+                    f"UPDATE {tbl} SET content=:content, status=:status "
+                    f"WHERE {pkcol}=:iid"
+                ),
+                {"content": content, "status": INSIGHT_STATUS_DONE, "iid": iid},
+            )
+            log.info("[insight] PENDING→DONE updated (insight_id=%s, user_id=%s)", iid, user_id)
+            return
+
+        # 2) 없으면 새로 INSERT (DONE)
         await conn.execute(
             text(
-                f"INSERT INTO {tbl} (user_id, content, status, createdAt) "
+                f"INSERT INTO {tbl} (user_id, content, status, {created_col}) "
                 f"VALUES (:uid, :content, :status, CURRENT_TIMESTAMP)"
             ),
             {"uid": user_id, "content": content, "status": INSIGHT_STATUS_DONE},
         )
-        return True
+        log.info("[insight] DONE inserted (no pending found) user_id=%s", user_id)
 
 # ────────────────────────────────────────────────────────────
 # Workers
@@ -442,12 +452,9 @@ async def run_insight_worker():
                         )
                         summary = _fallback_summary(vals, counts)
 
-                    # 4) 최종 결과만 INSERT (DONE, dedupe window)
-                    inserted = await insight_insert_done(int(user_id), summary)
-                    if inserted:
-                        log.info("[insight] inserted DONE for user_id=%s entries=%s", user_id, len(logs))
-                    else:
-                        log.info("[insight] skipped duplicate for user_id=%s", user_id)
+                    # 4) 기존 PENDING 1건을 DONE으로 업데이트, 없으면 INSERT(DONE)
+                    await insight_update_pending_or_insert_done(int(user_id), summary)
+                    log.info("[insight] done persisted for user_id=%s entries=%s", user_id, len(logs))
 
                 except Exception:
                     log.exception("[insight] processing failed.")
