@@ -45,6 +45,11 @@ INSIGHT_TTL_MS      = int(os.getenv("INSIGHT_TTL_MS")) if os.getenv("INSIGHT_TTL
 INSIGHT_TABLE       = os.getenv("INSIGHT_TABLE", "InsightEntity")
 INSIGHT_STATUS_DONE = os.getenv("INSIGHT_STATUS", "DONE")
 
+# 중복 방지 시간창 (초 단위 우선)
+_ins_min = int(os.getenv("INSIGHT_DEDUPE_MINUTES", "3"))
+INSIGHT_DEDUPE_SECONDS = int(os.getenv("INSIGHT_DEDUPE_SECONDS", str(_ins_min * 60)))
+INSIGHT_DEDUPE_SECONDS = max(1, min(3600, INSIGHT_DEDUPE_SECONDS))  # 1s ~ 3600s 안전 가드
+
 # GPT
 openai.api_key = os.getenv("OPENAI_API_KEY", "")
 GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
@@ -304,7 +309,7 @@ def generate_summary(vals: List[PlaceValence], counts: Dict[str, int]) -> str:
     return ""
 
 # ────────────────────────────────────────────────────────────
-# DB helpers  (DONE 한 번만 INSERT)
+# DB helpers  (DONE 한 번만 INSERT + 초 단위 중복 방지)
 # ────────────────────────────────────────────────────────────
 async def save_emotion(memo_id: int, label: str, score: float):
     """EmotionEntity: UPDATE 없으면 INSERT."""
@@ -322,12 +327,36 @@ async def save_emotion(memo_id: int, label: str, score: float):
             params,
         )
 
-async def insight_insert_done(user_id: int, content: str):
+async def insight_insert_done(user_id: int, content: str) -> bool:
     """
     PROCESSING 없이 최종 결과만 INSERT (status=DONE).
+    중복 방지: 최근 INSIGHT_DEDUPE_SECONDS 내 동일 (user_id, status, content) 존재 시 skip.
     """
     tbl = _safe_tbl(INSIGHT_TABLE)
+    window_sec = INSIGHT_DEDUPE_SECONDS
     async with engine.begin() as conn:
+        # 최근 window_sec초 내 동일 내용이 있으면 skip
+        exists = await conn.scalar(
+            text(
+                f"""
+                SELECT 1
+                FROM {tbl}
+                WHERE user_id = :uid
+                  AND status   = :st
+                  AND content  = :content
+                  AND createdAt >= DATE_SUB(CURRENT_TIMESTAMP, INTERVAL {window_sec} SECOND)
+                LIMIT 1
+                """
+            ),
+            {"uid": user_id, "st": INSIGHT_STATUS_DONE, "content": content},
+        )
+        if exists:
+            log.warning(
+                "[insight] duplicate detected — skip insert (user_id=%s, window=%ss)",
+                user_id, window_sec
+            )
+            return False
+
         await conn.execute(
             text(
                 f"INSERT INTO {tbl} (user_id, content, status, createdAt) "
@@ -335,6 +364,7 @@ async def insight_insert_done(user_id: int, content: str):
             ),
             {"uid": user_id, "content": content, "status": INSIGHT_STATUS_DONE},
         )
+        return True
 
 # ────────────────────────────────────────────────────────────
 # Workers
@@ -412,9 +442,12 @@ async def run_insight_worker():
                         )
                         summary = _fallback_summary(vals, counts)
 
-                    # 4) 최종 결과만 INSERT (DONE)
-                    await insight_insert_done(int(user_id), summary)
-                    log.info("[insight] inserted DONE for user_id=%s entries=%s", user_id, len(logs))
+                    # 4) 최종 결과만 INSERT (DONE, dedupe window)
+                    inserted = await insight_insert_done(int(user_id), summary)
+                    if inserted:
+                        log.info("[insight] inserted DONE for user_id=%s entries=%s", user_id, len(logs))
+                    else:
+                        log.info("[insight] skipped duplicate for user_id=%s", user_id)
 
                 except Exception:
                     log.exception("[insight] processing failed.")
