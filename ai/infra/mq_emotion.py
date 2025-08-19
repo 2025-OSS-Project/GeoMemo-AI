@@ -44,7 +44,7 @@ INSIGHT_PREFETCH       = int(os.getenv("INSIGHT_PREFETCH", "16"))
 INSIGHT_TTL_MS         = int(os.getenv("INSIGHT_TTL_MS")) if os.getenv("INSIGHT_TTL_MS") else None
 INSIGHT_TABLE          = os.getenv("INSIGHT_TABLE", "InsightEntity")
 INSIGHT_STATUS_DONE    = os.getenv("INSIGHT_STATUS", "DONE")
-INSIGHT_STATUS_PENDING = os.getenv("INSIGHT_STATUS_PENDING", "PENDING")   # ← 백엔드 사전 INSERT 상태
+INSIGHT_STATUS_PENDING = os.getenv("INSIGHT_STATUS_PENDING", "PENDING")   # 백엔드 사전 INSERT 상태
 INSIGHT_PK_COL         = os.getenv("INSIGHT_PK_COL", "insight_id")        # 예: insight_id 또는 id
 INSIGHT_CREATED_AT_COL = os.getenv("INSIGHT_CREATED_AT_COL", "createdAt") # 예: createdAt 또는 created_at
 
@@ -325,11 +325,11 @@ async def save_emotion(memo_id: int, label: str, score: float):
             params,
         )
 
-async def insight_update_pending_or_insert_done(user_id: int, content: str):
+async def insight_update_pending_only(user_id: int, content: str) -> Optional[int]:
     """
     백엔드가 먼저 PENDING을 INSERT한다는 전제:
-      1) 해당 user_id의 최신 PENDING 1건을 찾아 content/상태를 DONE으로 UPDATE
-      2) 없으면 새로 INSERT(DONE)
+      - 해당 user_id의 최신 PENDING 1건을 찾아 content/상태를 DONE으로 UPDATE
+      - **없으면 INSERT 하지 않음** (경고 로그만 남기고 None 반환)
     컬럼명은 환경변수로 조정 가능:
       - INSIGHT_PK_COL (기본: insight_id)
       - INSIGHT_CREATED_AT_COL (기본: createdAt)
@@ -340,7 +340,6 @@ async def insight_update_pending_or_insert_done(user_id: int, content: str):
 
     async with engine.begin() as conn:
         # 1) 최신 PENDING 한 건 조회
-        pending_row = None
         try:
             rs = await conn.execute(
                 text(
@@ -350,12 +349,13 @@ async def insight_update_pending_or_insert_done(user_id: int, content: str):
                 ),
                 {"uid": user_id, "st": INSIGHT_STATUS_PENDING},
             )
-            pending_row = rs.first()
+            row = rs.first()
         except Exception:
-            log.exception("[insight] SELECT pending failed — fallback to INSERT DONE")
+            log.exception("[insight] SELECT pending failed")
+            return None
 
-        if pending_row and pending_row[0] is not None:
-            iid = int(pending_row[0])
+        if row and row[0] is not None:
+            iid = int(row[0])
             await conn.execute(
                 text(
                     f"UPDATE {tbl} SET content=:content, status=:status "
@@ -364,17 +364,11 @@ async def insight_update_pending_or_insert_done(user_id: int, content: str):
                 {"content": content, "status": INSIGHT_STATUS_DONE, "iid": iid},
             )
             log.info("[insight] PENDING→DONE updated (insight_id=%s, user_id=%s)", iid, user_id)
-            return
+            return iid
 
-        # 2) 없으면 새로 INSERT (DONE)
-        await conn.execute(
-            text(
-                f"INSERT INTO {tbl} (user_id, content, status, {created_col}) "
-                f"VALUES (:uid, :content, :status, CURRENT_TIMESTAMP)"
-            ),
-            {"uid": user_id, "content": content, "status": INSIGHT_STATUS_DONE},
-        )
-        log.info("[insight] DONE inserted (no pending found) user_id=%s", user_id)
+        # 없으면 끝 (INSERT 하지 않음)
+        log.warning("[insight] no PENDING row to update (user_id=%s) — skipping persist", user_id)
+        return None
 
 # ────────────────────────────────────────────────────────────
 # Workers
@@ -431,11 +425,16 @@ async def run_insight_worker():
         async for msg in it:
             async with msg.process(ignore_processed=True):
                 try:
+                    # 디버그: payload 스냅샷
+                    log.debug("[insight] payload preview: %s", msg.body[:500])
+
                     payload = json.loads(msg.body.decode("utf-8"))
                     user_id = _pick(payload, "userId", "user_id")
                     logs = payload.get("logs")
                     if user_id is None or not isinstance(logs, list):
                         raise ValueError("payload must have userId and logs[]")
+
+                    log.info("[insight] logs length=%s (user_id=%s)", len(logs), user_id)
 
                     # 1) 통계 계산
                     counts = emotion_counts(logs)
@@ -452,9 +451,12 @@ async def run_insight_worker():
                         )
                         summary = _fallback_summary(vals, counts)
 
-                    # 4) 기존 PENDING 1건을 DONE으로 업데이트, 없으면 INSERT(DONE)
-                    await insight_update_pending_or_insert_done(int(user_id), summary)
-                    log.info("[insight] done persisted for user_id=%s entries=%s", user_id, len(logs))
+                    # 4) 기존 PENDING 1건만 DONE으로 업데이트 (없으면 skip)
+                    iid = await insight_update_pending_only(int(user_id), summary)
+                    if iid is not None:
+                        log.info("[insight] done persisted for user_id=%s entries=%s", user_id, len(logs))
+                    else:
+                        log.warning("[insight] skipped persist (no pending) for user_id=%s entries=%s", user_id, len(logs))
 
                 except Exception:
                     log.exception("[insight] processing failed.")
