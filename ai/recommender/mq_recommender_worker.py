@@ -2,12 +2,10 @@ from __future__ import annotations
 import os, json, time, asyncio, logging, traceback
 from typing import Dict, List, Set, Optional, Any
 
-import aio_pika
-from aio_pika import IncomingMessage, DeliveryMode
-from aio_pika.exceptions import DeliveryError
-from aiormq.exceptions import ChannelPreconditionFailed
+import aioboto3
+from botocore.exceptions import ClientError
 
-from ai.infra.mq_common import connect_channel, declare_queues, RES_QUEUE
+# 내부 추천 로직/스키마 (기존 그대로 사용)
 from ai.recommender.schema import Place, to_label_idx
 from ai.recommender.recommender import recommend_top_n
 
@@ -21,8 +19,25 @@ logging.basicConfig(
 )
 log = logging.getLogger("reco-worker")
 
+# ─────────────────────────────────────────────────────────
+# ENV (URL 우선, 없으면 이름으로 조회)
+# ─────────────────────────────────────────────────────────
+AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
+
+RECO_REQ_QUEUE_URL = os.getenv("RECO_REQ_QUEUE_URL")
+RECO_RES_QUEUE_URL = os.getenv("RECO_RES_QUEUE_URL")
+RECO_REQ_QUEUE     = os.getenv("RECO_REQ_QUEUE", "geomemo-reco-req")
+RECO_RES_QUEUE     = os.getenv("RECO_RES_QUEUE", "geomemo-reco-res")
+
+# 롱 폴링/가시성/배치 (AWS 권장값)
+SQS_WAIT_TIME = int(os.getenv("SQS_WAIT_TIME", "20"))            # Long Poll ≤20s
+SQS_VISIBILITY_TIMEOUT = int(os.getenv("SQS_VISIBILITY_TIMEOUT", "60"))
+SQS_MAX_NUMBER = int(os.getenv("SQS_MAX_NUMBER", "10"))          # 1~10
+
+# ─────────────────────────────────────────────────────────
+# 유틸
+# ─────────────────────────────────────────────────────────
 def to_jsonable(x):
-    """JSON 직렬화 안전 변환."""
     if x is None or isinstance(x, (str, int, float, bool)):
         return x
     if isinstance(x, dict):
@@ -43,36 +58,48 @@ def to_jsonable(x):
     return str(x)
 
 def safe_to_label_idx(label: Optional[str]) -> Optional[int]:
-    """라벨을 추천용 인덱스로 안전 변환. 모르면 None(무시)."""
     if not label:
         return None
     try:
         return to_label_idx(label)
     except Exception:
-        # 프로젝트 감정 라벨(기쁨/놀람/분노/불안/상처/슬픔) 외의 값(예: 긍정/중립)은 무시
         log.debug(f"[recentEmotion] unknown label ignored: {label}")
         return None
 
-# ---------- 결과 publish ----------
-async def publish_result(ch: aio_pika.Channel, body: dict, target_queue: str, correlation_id: Optional[str]):
-    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    msg = aio_pika.Message(
-        body=payload,
-        content_type="application/json",
-        correlation_id=correlation_id,
-        delivery_mode=DeliveryMode.PERSISTENT,
-    )
-    # mandatory=True → 라우팅 실패 시 DeliveryError
-    await ch.default_exchange.publish(msg, routing_key=target_queue, mandatory=True)
-    log.info(f"[publish] ok → queue='{target_queue}', corr='{correlation_id}', bytes={len(payload)}")
+async def _resolve_queue_url(sqs, explicit: Optional[str], name: str) -> str:
+    if explicit:
+        return explicit
+    # 이름만 있으면 URL 조회
+    r = await sqs.get_queue_url(QueueName=name)  # GetQueueUrl 사용
+    return r["QueueUrl"]
 
-# ---------- 요청 파싱 ----------
+def _unwrap_body(body: str) -> Optional[dict]:
+    """SQS 직접 JSON 또는 SNS→SQS 래핑({"Message": "..."}) 모두 지원."""
+    try:
+        raw = json.loads(body)
+        if isinstance(raw, dict) and "Message" in raw and isinstance(raw["Message"], str):
+            return json.loads(raw["Message"])
+        return raw if isinstance(raw, dict) else None
+    except Exception:
+        return None
+
+def _attr_str(attrs: Optional[Dict[str, Any]], key: str) -> Optional[str]:
+    if not attrs:
+        return None
+    v = attrs.get(key)
+    if isinstance(v, dict):
+        return v.get("StringValue")
+    return None
+
+# ─────────────────────────────────────────────────────────
+# 요청 파싱 (원본 로직 유지)
+# ─────────────────────────────────────────────────────────
 def parse_request(payload: Dict[str, Any]):
     user_id = int(payload["userId"])
     top = int(payload.get("top", 5))
     debug = bool(payload.get("debug", False))
 
-    # 후보는 이미 placeId/name/category/latitude/longitude 로 들어옴
+    # 후보 목록: placeId/name/category/latitude/longitude
     candidates = []
     for i, p in enumerate(payload.get("candidates") or []):
         try:
@@ -82,31 +109,24 @@ def parse_request(payload: Dict[str, Any]):
 
     ctx = payload.get("context", {}) or {}
 
-    # recentEmotion: dict 또는 list 모두 지원
+    # recentEmotion: dict 또는 list
     r = ctx.get("recentEmotion")
     recent_idx: Optional[int] = None
     recent_score: float = 0.0
-
     if isinstance(r, dict):
         recent_idx = safe_to_label_idx(r.get("label"))
         recent_score = float(r.get("score") or 0.0)
     elif isinstance(r, list) and r:
-        # 점수가 가장 높은 항목을 사용
         try:
             best = max(r, key=lambda x: float(x.get("score") or 0.0))
         except Exception:
             best = r[0]
         recent_idx = safe_to_label_idx(best.get("label"))
         recent_score = float(best.get("score") or 0.0)
-    elif r is not None:
-        log.debug(f"[recentEmotion] unsupported type: {type(r).__name__}")
 
-    # 선호 카테고리/스크랩/팔로우 정보
     fav_categories: Dict[str, int] = dict(ctx.get("favCategories") or {})
     scrap_place_ids: Set[int] = set(ctx.get("scrapPlaceIds") or [])
-    # followedUserIds 는 현재 로직에서 직접 사용하지 않음(장소별 followedPositiveCount 로 반영됨)
 
-    # 장소 시그널
     pos_ratio: Dict[int, float] = {}
     followed_pos_count: Dict[int, int] = {}
     for ps in (ctx.get("placeSignals") or []):
@@ -134,121 +154,132 @@ def parse_request(payload: Dict[str, Any]):
         "cand_count": len(candidates),
     }
 
-# ---------- 소비 콜백 ----------
-async def on_message(msg: IncomingMessage, ch: aio_pika.Channel):
-    started = time.time()
-    payload: Dict[str, Any] = {}
-    res: Dict[str, Any] = {}
-
-    # reply_to 우선, 없으면 환경변수/상수 RES_QUEUE
-    target_queue = msg.reply_to or os.getenv("RECO_RES_QUEUE", RES_QUEUE)
-
-    log.info(
-        f"[recv] corr='{msg.correlation_id}', reply_to='{msg.reply_to}', "
-        f"bytes={len(msg.body) if msg.body else 0}"
+# ─────────────────────────────────────────────────────────
+# 발행 (응답) — SQS send_message
+# ─────────────────────────────────────────────────────────
+async def publish_result(sqs, body: dict, *, reply_to_url: Optional[str], correlation_id: Optional[str]):
+    url = reply_to_url or RECO_RES_QUEUE_URL
+    if not url:
+        # URL이 비어 있으면 이름으로 조회
+        url = await _resolve_queue_url(sqs, None, RECO_RES_QUEUE)
+    payload = json.dumps(body, ensure_ascii=False)
+    attrs = {}
+    if correlation_id:
+        attrs["correlation_id"] = {"DataType": "String", "StringValue": correlation_id}
+    await sqs.send_message(  # boto3: send_message
+        QueueUrl=url,
+        MessageBody=payload,
+        MessageAttributes=attrs or None,
     )
+    log.info(f"[publish] ok → url='{url}', corr='{correlation_id}', bytes={len(payload.encode('utf-8'))}")
 
-    try:
-        payload = json.loads(msg.body)
-        req_id = payload.get("requestId") or msg.correlation_id
+# ─────────────────────────────────────────────────────────
+# 컨슈머 루프 — ReceiveMessage(Long Poll) → 처리 → Delete
+# ─────────────────────────────────────────────────────────
+async def _consume():
+    session = aioboto3.Session()
+    async with session.client("sqs", region_name=AWS_REGION) as sqs:
+        req_url = await _resolve_queue_url(sqs, RECO_REQ_QUEUE_URL, RECO_REQ_QUEUE)
+        log.info(f"[*] Recommender worker started. reqQueueUrl='{req_url}', "
+                 f"resQueueUrl='{RECO_RES_QUEUE_URL or '(resolve by name)'}', "
+                 f"wait={SQS_WAIT_TIME}, max={SQS_MAX_NUMBER}, vis={SQS_VISIBILITY_TIMEOUT}")
 
-        parsed = parse_request(payload)
-        log.info(
-            f"[parse] userId={parsed['user_id']}, cand={parsed['cand_count']}, "
-            f"top={parsed['top']}, debug={parsed['debug']}, "
-            f"recent_idx={parsed['recent_idx']}, recent_score={parsed['recent_score']}"
-        )
+        while True:
+            try:
+                resp = await sqs.receive_message(
+                    QueueUrl=req_url,
+                    WaitTimeSeconds=SQS_WAIT_TIME,               # Long Poll (≤20s)
+                    MaxNumberOfMessages=SQS_MAX_NUMBER,          # ≤10
+                    VisibilityTimeout=SQS_VISIBILITY_TIMEOUT,
+                    MessageAttributeNames=["All"],
+                    AttributeNames=["All"],
+                )
+                msgs = resp.get("Messages", [])
+                if not msgs:
+                    continue
 
-        items = recommend_top_n(
-            user_id=parsed["user_id"],
-            candidate_places=parsed["candidates"],
-            recent_emotion_idx=parsed["recent_idx"],
-            recent_emotion_score=parsed["recent_score"],
-            fav_categories=parsed["fav_categories"],
-            scrap_place_ids=parsed["scrap_place_ids"],
-            place_positive_ratio=parsed["pos_ratio"],
-            followed_positive_count=parsed["followed_pos_count"],
-            top_n=parsed["top"],
-            debug=parsed["debug"],
-        )
+                to_delete: List[Dict[str, str]] = []
 
-        items = to_jsonable(items)
+                for m in msgs:
+                    started = time.time()
+                    body_str = m.get("Body") or ""
+                    attrs = m.get("MessageAttributes") or {}
+                    # reply_to(선호: URL), 없으면 기본값 사용
+                    reply_to = _attr_str(attrs, "reply_to")
+                    correlation_id = _attr_str(attrs, "correlation_id")
+                    payload: Dict[str, Any] = {}
+                    res: Dict[str, Any] = {}
 
-        res = {
-            "requestId": req_id,
-            "userId": parsed["user_id"],
-            "status": "ok",
-            "items": items,
-            "meta": {
-                "model": "reco-v1.1",
-                "elapsedMs": int((time.time() - started) * 1000),
-            },
-        }
+                    try:
+                        payload = _unwrap_body(body_str) or {}
+                        req_id = payload.get("requestId") or correlation_id
 
-    except Exception as e:
-        log.error(f"[error] {type(e).__name__}: {e}")
-        log.debug(traceback.format_exc())
-        req_id = (payload.get("requestId") if isinstance(payload, dict) else None) or msg.correlation_id
-        res = {
-            "requestId": req_id,
-            "userId": payload.get("userId") if isinstance(payload, dict) else None,
-            "status": "error",
-            "error": f"{type(e).__name__}: {e}",
-            "meta": {"model": "reco-v1.1"},
-        }
+                        parsed = parse_request(payload)
+                        log.info(
+                            f"[recv] corr='{correlation_id}', reply_to='{reply_to}', "
+                            f"bytes={len(body_str)}, userId={parsed['user_id']}, "
+                            f"cand={parsed['cand_count']}, top={parsed['top']}, debug={parsed['debug']}"
+                        )
 
-    try:
-        await publish_result(ch, res, target_queue, msg.correlation_id or res.get("requestId"))
-        await msg.ack()
-        log.info(f"[ack] corr='{msg.correlation_id}' done")
-    except DeliveryError as de:
-        log.error(f"[publish-fail] queue='{target_queue}' corr='{msg.correlation_id}' → {de}. NACK requeue")
-        await msg.nack(requeue=True)
-    except Exception as e:
-        log.error(f"[publish-fail] unexpected: {type(e).__name__}: {e}. NACK requeue")
-        log.debug(traceback.format_exc())
-        await msg.nack(requeue=True)
+                        items = recommend_top_n(
+                            user_id=parsed["user_id"],
+                            candidate_places=parsed["candidates"],
+                            recent_emotion_idx=parsed["recent_idx"],
+                            recent_emotion_score=parsed["recent_score"],
+                            fav_categories=parsed["fav_categories"],
+                            scrap_place_ids=parsed["scrap_place_ids"],
+                            place_positive_ratio=parsed["pos_ratio"],
+                            followed_positive_count=parsed["followed_pos_count"],
+                            top_n=parsed["top"],
+                            debug=parsed["debug"],
+                        )
+                        items = to_jsonable(items)
 
-# ---------- 진입점 ----------
-async def main():
-    conn, ch = await connect_channel()
+                        res = {
+                            "requestId": req_id,
+                            "userId": parsed["user_id"],
+                            "status": "ok",
+                            "items": items,
+                            "meta": {
+                                "model": "reco-v1.1",
+                                "elapsedMs": int((time.time() - started) * 1000),
+                            },
+                        }
 
-    # 요청 큐 선언 (타입까지 맞춤)
-    req_q = await declare_queues(ch)
+                    except Exception as e:
+                        log.error(f"[error] {type(e).__name__}: {e}")
+                        log.debug(traceback.format_exc())
+                        req_id = (payload.get("requestId") if isinstance(payload, dict) else None) or correlation_id
+                        res = {
+                            "requestId": req_id,
+                            "userId": payload.get("userId") if isinstance(payload, dict) else None,
+                            "status": "error",
+                            "error": f"{type(e).__name__}: {e}",
+                            "meta": {"model": "reco-v1.1"},
+                        }
 
-    # ---- 응답 큐 보장 (reply_to 없는 fallback일 때만) ----
-    res_q_name_env = os.getenv("RECO_RES_QUEUE", RES_QUEUE)
-    skip_res_declare = os.getenv("RECO_SKIP_RES_DECLARE", "0") == "1"
-    if not skip_res_declare:
-        res_q_type = os.getenv("RECO_RES_QUEUE_TYPE", os.getenv("MQ_QUEUE_TYPE", "quorum")).strip().lower()
-        res_args = {"x-queue-type": res_q_type} if res_q_type else None
-        try:
-            await ch.declare_queue(res_q_name_env, durable=True, arguments=res_args)
-            log.info(f"[startup] resQueue declared name='{res_q_name_env}' type='{res_q_type}'")
-        except ChannelPreconditionFailed as e:
-            log.error(f"[startup] RES queue precondition failed: {e}. "
-                      f"코드/ENV의 큐 타입이 브로커에 이미 생성된 큐 타입과 다릅니다. "
-                      f"운영 정책과 일치시키세요.")
-            raise
-    else:
-        log.info(f"[startup] skip declaring resQueue (RECO_SKIP_RES_DECLARE=1)")
+                    # 응답 발행 → 처리 성공 시에만 삭제
+                    try:
+                        await publish_result(sqs, res, reply_to_url=reply_to, correlation_id=correlation_id or res.get("requestId"))
+                        to_delete.append({"Id": m["MessageId"], "ReceiptHandle": m["ReceiptHandle"]})
+                    except Exception:
+                        log.exception("[publish-fail] unexpected; will retry (no delete)")
 
-    # prefetch(선택)
-    try:
-        await ch.set_qos(prefetch_count=int(os.getenv("RECO_PREFETCH", "8")))
-    except Exception:
-        pass
+                if to_delete:
+                    # 삭제는 **ReceiptHandle**로만 가능
+                    await sqs.delete_message_batch(QueueUrl=req_url, Entries=to_delete)
 
-    log.info(f"[*] Recommender worker started. Waiting for messages… reqQueue='{req_q.name}', "
-             f"resQueue='{res_q_name_env}', queueType='{os.getenv('MQ_QUEUE_TYPE','quorum')}', "
-             f"skipResDeclare={skip_res_declare}")
+            except asyncio.CancelledError:
+                break
+            except ClientError:
+                log.exception("[loop] AWS error; retry")
+                await asyncio.sleep(1.0)
+            except Exception:
+                log.exception("[loop] unexpected; retry")
+                await asyncio.sleep(1.0)
 
-    await req_q.consume(lambda m: on_message(m, ch))
-
-    try:
-        await asyncio.Future()
-    finally:
-        await conn.close()
+def run():
+    asyncio.run(_consume())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run()
