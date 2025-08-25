@@ -1,30 +1,32 @@
-# ai/infra/mq_consumer.py — SQS long-polling consumer (events)
+# ai/infra/mq_consumer.py — SQS 이벤트 버스 컨슈머
 from __future__ import annotations
 import os, json, logging, asyncio
 from collections import defaultdict, deque
 from typing import Dict, List, Set, Tuple, Optional, Any
 
 import aioboto3
-from botocore.exceptions import ClientError
 from dotenv import load_dotenv
+from botocore.exceptions import ClientError
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("mq-consumer")
 
-# ── In-memory 캐시 (원본 로직 그대로) ─────────────────────────────────────
+# ── In-memory 캐시 (원본 유지) ───────────────────────────────────────────────
 place_category: Dict[int, str] = {}
 place_name: Dict[int, str] = {}
 memo_index: Dict[int, dict] = {}
 
-from collections import defaultdict
 place_counts: Dict[int, Dict[str, int]] = defaultdict(lambda: {"total": 0, "pos": 0})
 place_pos_ratio: Dict[int, float] = {}
+
 pos_count_by_place_user: Dict[Tuple[int,int], int] = defaultdict(int)
 positive_authors: Dict[int, Set[int]] = defaultdict(set)
+
 user_memos_cache: Dict[int, deque] = defaultdict(lambda: deque(maxlen=200))
 scraps_by_user_cache: Dict[int, Set[int]] = defaultdict(set)
 followings_by_user_cache: Dict[int, Set[int]] = defaultdict(set)
+
 pending_scraps: Dict[int, List[Tuple[int, str]]] = defaultdict(list)
 
 POSITIVE_LABELS = {"기쁨", "놀람", 0, 1}
@@ -126,17 +128,15 @@ def handle_event(event: str, payload: dict):
 
 # ── SQS 설정 ────────────────────────────────────────────────────────────────
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
-
-# (이벤트 큐) URL 우선, 없으면 이름으로 조회
-SQS_EVENTS_URL   = os.getenv("SQS_EVENTS_URL")            # 선택: 사용 시 .env에 추가
+SQS_EVENTS_URL   = os.getenv("SQS_EVENTS_URL")
 SQS_EVENTS_QUEUE = os.getenv("SQS_EVENTS_QUEUE", "geomemo-events")
 
-SQS_WAIT_TIME = int(os.getenv("SQS_WAIT_TIME", "20"))
+SQS_WAIT_TIME = int(os.getenv("SQS_WAIT_TIME", "20"))              # ≤20
 SQS_VISIBILITY_TIMEOUT = int(os.getenv("SQS_VISIBILITY_TIMEOUT", "60"))
-SQS_MAX_NUMBER = int(os.getenv("SQS_MAX_NUMBER", "10"))
+SQS_MAX_NUMBER = int(os.getenv("SQS_MAX_NUMBER", "10"))            # 1~10
 
 def _unwrap(body: str) -> Optional[dict]:
-    # SQS 직발행 or SNS→SQS 래핑 모두 지원
+    # SQS 직접 JSON 또는 SNS→SQS 래핑 {"Message": "..."} 모두 지원
     try:
         raw = json.loads(body)
         if isinstance(raw, dict) and "Message" in raw and isinstance(raw["Message"], str):
@@ -144,10 +144,6 @@ def _unwrap(body: str) -> Optional[dict]:
         return raw if isinstance(raw, dict) else None
     except Exception:
         return None
-
-def _attr(attrs: Dict[str, Any], name: str) -> Optional[str]:
-    v = attrs.get(name); 
-    return v.get("StringValue") if isinstance(v, dict) else None
 
 async def _resolve_url(client):
     if SQS_EVENTS_URL:
@@ -174,18 +170,17 @@ async def _consume():
                 if not msgs:
                     continue
                 for m in msgs:
-                    payload = _unwrap(m.get("Body", ""))  # 본문 파싱
+                    payload = _unwrap(m.get("Body", ""))
                     if payload is None:
                         log.error("[consumer] invalid JSON -> drop")
                         await sqs.delete_message(QueueUrl=url, ReceiptHandle=m["ReceiptHandle"])
                         continue
+                    # event 키는 속성 또는 본문에서 추출
                     attrs = m.get("MessageAttributes") or {}
-                    event = _attr(attrs, "event") or payload.get("event") or payload.get("type") or ""
+                    event = (attrs.get("event") or {}).get("StringValue") or payload.get("event") or payload.get("type") or ""
                     try:
                         handle_event(event, payload)
                     finally:
-                        # 처리 성공/실패와 무관하게 삭제하려면 여기서 delete
-                        # (실패 시 재시도를 원하면 예외 시 삭제하지 마세요)
                         await sqs.delete_message(QueueUrl=url, ReceiptHandle=m["ReceiptHandle"])
             except asyncio.CancelledError:
                 break

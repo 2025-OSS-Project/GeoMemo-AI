@@ -1,4 +1,4 @@
-# ai/infra/mq_emotion.py — AWS SQS 버전
+# ai/infra/mq_emotion.py — AWS SQS 버전 (Emotion + Insight)
 from __future__ import annotations
 
 import os, json, asyncio, logging, re
@@ -17,6 +17,7 @@ from sqlalchemy import text
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
+# === OpenAI (GPT 요약용) ===
 import openai
 
 load_dotenv()
@@ -25,11 +26,11 @@ log = logging.getLogger("mq-workers")
 
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
 
-# Emotion/Insight 큐 URL(우선) + 이름(대안)
-SQS_EMOTION_URL = os.getenv("SQS_EMOTION_URL")
-SQS_EMOTION_QUEUE = os.getenv("SQS_EMOTION_QUEUE", "geomemo-emotion-req")
-SQS_INSIGHT_URL = os.getenv("SQS_INSIGHT_URL")
-SQS_INSIGHT_QUEUE = os.getenv("SQS_INSIGHT_QUEUE", "geomemo-insight-req")
+# FastAPI 백엔드와 동일 키명 사용 (URL 우선)
+EMOTION_REQ_QUEUE_URL = os.getenv("EMOTION_REQ_QUEUE_URL")
+INSIGHT_REQ_QUEUE_URL = os.getenv("INSIGHT_REQ_QUEUE_URL")
+EMOTION_REQ_QUEUE = os.getenv("EMOTION_REQ_QUEUE", "geomemo-emotion-req")
+INSIGHT_REQ_QUEUE  = os.getenv("INSIGHT_REQ_QUEUE", "geomemo-insight-req")
 
 # SQS 소비 튜닝
 SQS_WAIT_TIME = int(os.getenv("SQS_WAIT_TIME", "20"))
@@ -74,21 +75,6 @@ def _safe_tbl(name: str) -> str:
         raise ValueError(f"Invalid table name: {name!r}")
     return name
 
-def _parse_body(body: str) -> Optional[Dict[str, Any]]:
-    try:
-        raw = json.loads(body)
-        if isinstance(raw, dict) and "Message" in raw and isinstance(raw["Message"], str):
-            return json.loads(raw["Message"])
-        return raw if isinstance(raw, dict) else None
-    except Exception:
-        return None
-
-def _pick(d: Dict[str, Any], *keys, default=None):
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return default
-
 # ─ Emotion model ─
 _emo_loaded = False
 _emo_tok: Optional[AutoTokenizer] = None
@@ -109,8 +95,12 @@ def _load_emotion_model():
     _emo_model.eval()
     cfg = _emo_model.config
     if isinstance(getattr(cfg, "id2label", None), dict):
-        _emo_id2label[:] = {}
-    _emo_id2label.update({int(k): str(v) for k, v in getattr(cfg, "id2label", {}).items()} or {i: f"L{i}" for i in range(cfg.num_labels)})
+        _emo_id2label = {int(k): str(v) for k, v in cfg.id2label.items()}
+    elif isinstance(getattr(cfg, "id2label", None), (list, tuple)):
+        _emo_id2label = {i: str(v) for i, v in enumerate(cfg.id2label)}
+    else:
+        _emo_id2label = {i: f"L{i}" for i in range(cfg.num_labels)}
+    log.info("[emotion] model ready. labels=%s", _emo_id2label)
     _emo_loaded = True
 
 def _infer_sync(text_str: str) -> Tuple[str, float]:
@@ -224,9 +214,17 @@ async def save_emotion(memo_id: int, label: str, score: float):
         if res.rowcount and res.rowcount>0: return
         await conn.execute(text(f"INSERT INTO {tbl} (memo_id, emotion_label, emotion_score) VALUES (:memo_id, :label, :score)"), params)
 
-async def insight_update_pending_only(user_id: int, content: str) -> Optional[int]:
+async def insight_update_by_id_or_pending(insight_id: Optional[int], user_id: Optional[int], content: str) -> Optional[int]:
     tbl=_safe_tbl(INSIGHT_TABLE); pkcol=_safe_tbl(INSIGHT_PK_COL); created_col=_safe_tbl(INSIGHT_CREATED_AT_COL)
     async with engine.begin() as conn:
+        # 1) insightId가 오면 그 행만 DONE
+        if insight_id is not None:
+            await conn.execute(text(f"UPDATE {tbl} SET content=:content, status=:status WHERE {pkcol}=:iid"),
+                               {"content": content, "status": INSIGHT_STATUS_DONE, "iid": int(insight_id)})
+            log.info("[insight] DONE by id (insight_id=%s)", insight_id)
+            return int(insight_id)
+
+        # 2) 아니면 최신 PENDING 1건만 DONE
         try:
             rs=await conn.execute(text(
                 f"SELECT {pkcol} FROM {tbl} WHERE user_id=:uid AND status=:st ORDER BY {created_col} DESC LIMIT 1"
@@ -242,14 +240,28 @@ async def insight_update_pending_only(user_id: int, content: str) -> Optional[in
             return iid
         log.warning("[insight] no pending row (user_id=%s)", user_id); return None
 
-# ─ SQS consumers ─
+# ─ SQS utils ─
+def _pick(d: Dict[str, Any], *keys, default=None):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
 async def _resolve_queue_url(client, explicit: Optional[str], name: str) -> str:
     if explicit: return explicit
-    r = await client.get_queue_url(QueueName=name)
-    return r["QueueUrl"]
+    r = await client.get_queue_url(QueueName=name); return r["QueueUrl"]
+
+def _parse_body(body: str) -> Optional[Dict[str, Any]]:
+    try:
+        raw = json.loads(body)
+        if isinstance(raw, dict) and "Message" in raw and isinstance(raw["Message"], str):
+            return json.loads(raw["Message"])
+        return raw if isinstance(raw, dict) else None
+    except Exception:
+        return None
 
 async def _consume_emotion(client):
-    url = await _resolve_queue_url(client, SQS_EMOTION_URL, SQS_EMOTION_QUEUE)
+    url = await _resolve_queue_url(client, EMOTION_REQ_QUEUE_URL, EMOTION_REQ_QUEUE)
     log.info("[emotion] ready: url=%s wait=%s vis=%s", url, SQS_WAIT_TIME, SQS_VISIBILITY_TIMEOUT)
     while True:
         try:
@@ -257,9 +269,7 @@ async def _consume_emotion(client):
                 QueueUrl=url, WaitTimeSeconds=SQS_WAIT_TIME, MaxNumberOfMessages=SQS_MAX_NUMBER,
                 VisibilityTimeout=SQS_VISIBILITY_TIMEOUT, MessageAttributeNames=["All"], AttributeNames=["All"]
             )
-            msgs = resp.get("Messages", [])
-            if not msgs: continue
-            entries=[]
+            msgs = resp.get("Messages", []); entries=[]
             for m in msgs:
                 payload = _parse_body(m.get("Body",""))
                 if not isinstance(payload, dict):
@@ -286,7 +296,7 @@ async def _consume_emotion(client):
             await asyncio.sleep(1.0)
 
 async def _consume_insight(client):
-    url = await _resolve_queue_url(client, SQS_INSIGHT_URL, SQS_INSIGHT_QUEUE)
+    url = await _resolve_queue_url(client, INSIGHT_REQ_QUEUE_URL, INSIGHT_REQ_QUEUE)
     log.info("[insight] ready: url=%s wait=%s vis=%s", url, SQS_WAIT_TIME, SQS_VISIBILITY_TIMEOUT)
     while True:
         try:
@@ -294,9 +304,7 @@ async def _consume_insight(client):
                 QueueUrl=url, WaitTimeSeconds=SQS_WAIT_TIME, MaxNumberOfMessages=SQS_MAX_NUMBER,
                 VisibilityTimeout=SQS_VISIBILITY_TIMEOUT, MessageAttributeNames=["All"], AttributeNames=["All"]
             )
-            msgs = resp.get("Messages", [])
-            if not msgs: continue
-            entries=[]
+            msgs = resp.get("Messages", []); entries=[]
             for m in msgs:
                 payload = _parse_body(m.get("Body",""))
                 if not isinstance(payload, dict):
@@ -304,14 +312,17 @@ async def _consume_insight(client):
                     entries.append({"Id": m["MessageId"], "ReceiptHandle": m["ReceiptHandle"]})
                     continue
                 try:
+                    insight_id = _pick(payload, "insightId","id")
                     user_id = _pick(payload, "userId","user_id")
                     logs = payload.get("logs")
-                    if user_id is None or not isinstance(logs, list):
-                        raise ValueError("payload must have userId and logs[]")
+                    if (insight_id is None and user_id is None) or not isinstance(logs, list):
+                        raise ValueError("payload must have insightId 또는 userId, 그리고 logs[] 필요")
                     counts = emotion_counts(logs)
                     vals = place_valences(logs)
                     summary = generate_summary(vals, counts) or _fallback_summary(vals, counts)
-                    await insight_update_pending_only(int(user_id), summary)
+                    await insight_update_by_id_or_pending(int(insight_id) if insight_id is not None else None,
+                                                          int(user_id) if user_id is not None else None,
+                                                          summary)
                     entries.append({"Id": m["MessageId"], "ReceiptHandle": m["ReceiptHandle"]})
                 except Exception:
                     log.exception("[insight] processing failed; will retry (no delete)")
