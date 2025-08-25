@@ -1,33 +1,116 @@
+# mq_common.py — AWS SQS 드롭인 교체본
 from __future__ import annotations
-import os, asyncio, logging
-import aio_pika
+import os, json, asyncio, logging
+from typing import Optional, Dict, Any, Awaitable, Callable
+
+import aioboto3
+from botocore.exceptions import ClientError
 
 log = logging.getLogger("mq-common")
 
-# 기본 응답 큐 이름(백업 용)
-RES_QUEUE = os.getenv("RECO_RES_QUEUE", "reco.res")
+AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
+
+# RECO 요청/응답 큐: URL 우선, 없으면 이름으로 조회
+SQS_RECO_REQ_URL = os.getenv("SQS_RECO_REQ_URL")
+SQS_RECO_RES_URL = os.getenv("SQS_RECO_RES_URL")
+SQS_RECO_REQ_QUEUE = os.getenv("SQS_RECO_REQ_QUEUE", "geomemo-reco-req")
+SQS_RECO_RES_QUEUE = os.getenv("SQS_RECO_RES_QUEUE", "geomemo-reco-res")
+
+# 폴링 튜닝
+SQS_WAIT_TIME = int(os.getenv("SQS_WAIT_TIME", "20"))            # 롱폴링(최대 20)
+SQS_VISIBILITY_TIMEOUT = int(os.getenv("SQS_VISIBILITY_TIMEOUT", "60"))
+SQS_MAX_NUMBER = int(os.getenv("SQS_MAX_NUMBER", "10"))          # 1~10
 
 async def connect_channel():
-    amqp_url = os.getenv("AMQP_URL")
-    if not amqp_url:
-        raise RuntimeError("Missing AMQP_URL")
-    # robust connect (자동 재연결)
-    conn = await aio_pika.connect_robust(
-        amqp_url,
-        client_properties={"connection_name": os.getenv("AMQP_CONN_NAME", "geomemo-ai")},
-        timeout=30,
-        heartbeat=30,
+    """
+    aio_pika의 (conn, ch) 반환 패턴을 흉내냅니다.
+    여기서는 같은 aioboto3 SQS client를 두 번 반환해 시그니처 호환만 유지합니다.
+    """
+    session = aioboto3.Session()
+    client = session.client("sqs", region_name=AWS_REGION)
+    return client, client
+
+async def _resolve_queue_url(client, explicit_url: Optional[str], name: str) -> str:
+    if explicit_url:
+        return explicit_url
+    resp = await client.get_queue_url(QueueName=name)
+    return resp["QueueUrl"]
+
+def _get_attr(attrs: Dict[str, Any], key: str) -> Optional[str]:
+    v = attrs.get(key)
+    if isinstance(v, dict):
+        return v.get("StringValue")
+    return None
+
+class SQSIncomingMessage:
+    def __init__(self, client, queue_url: str, raw: Dict[str, Any]):
+        self._client = client
+        self._queue_url = queue_url
+        self._raw = raw
+        self.body: bytes = raw.get("Body", "").encode("utf-8")
+        self.delivery_tag: str = raw.get("ReceiptHandle", "")
+        attrs = raw.get("MessageAttributes", {}) or {}
+        self.reply_to: Optional[str] = _get_attr(attrs, "reply_to")
+        self.correlation_id: Optional[str] = _get_attr(attrs, "correlation_id")
+
+    async def ack(self):
+        await self._client.delete_message(QueueUrl=self._queue_url, ReceiptHandle=self.delivery_tag)
+
+class SQSQueue:
+    def __init__(self, client, queue_url: str):
+        self._client = client
+        self._queue_url = queue_url
+        self._stop = asyncio.Event()
+
+    async def consume(self, callback: Callable[[SQSIncomingMessage], Awaitable[None]]):
+        log.info("[consume] start long-polling url=%s wait=%s vis=%s",
+                 self._queue_url, SQS_WAIT_TIME, SQS_VISIBILITY_TIMEOUT)
+        while not self._stop.is_set():
+            try:
+                resp = await self._client.receive_message(
+                    QueueUrl=self._queue_url,
+                    WaitTimeSeconds=SQS_WAIT_TIME,
+                    MaxNumberOfMessages=SQS_MAX_NUMBER,
+                    VisibilityTimeout=SQS_VISIBILITY_TIMEOUT,
+                    MessageAttributeNames=["All"],
+                    AttributeNames=["All"],
+                )
+                msgs = resp.get("Messages", [])
+                if not msgs:
+                    continue
+                for raw in msgs:
+                    msg = SQSIncomingMessage(self._client, self._queue_url, raw)
+                    try:
+                        await callback(msg)
+                    except Exception:
+                        log.exception("[consume] handler error; will re-deliver after visibility timeout")
+                    else:
+                        await msg.ack()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.exception("[consume] long-polling error; continue")
+                await asyncio.sleep(1.0)
+
+    async def stop(self):
+        self._stop.set()
+
+async def declare_queues(ch) -> SQSQueue:
+    client = ch
+    url = await _resolve_queue_url(client, SQS_RECO_REQ_URL, SQS_RECO_REQ_QUEUE)
+    log.info("[declare] reqQueue url=%s", url)
+    return SQSQueue(client, url)
+
+async def publish_reply(client, payload: Dict[str, Any], *,
+                        reply_to_url: Optional[str] = None,
+                        correlation_id: Optional[str] = None):
+    url = reply_to_url or await _resolve_queue_url(client, SQS_RECO_RES_URL, SQS_RECO_RES_QUEUE)
+    attrs = {}
+    if correlation_id:
+        attrs["correlation_id"] = {"StringValue": correlation_id, "DataType": "String"}
+    await client.send_message(
+        QueueUrl=url,
+        MessageBody=json.dumps(payload, ensure_ascii=False),
+        MessageAttributes=attrs,
     )
-    ch = await conn.channel()
-    return conn, ch
-
-async def declare_queues(ch: aio_pika.Channel):
-    """추천 요청 큐를 선언하고 Queue 객체를 반환한다."""
-    req_name = os.getenv("RECO_REQ_QUEUE", "reco.req")
-    # 타입 우선순위: RECO_REQ_QUEUE_TYPE > MQ_QUEUE_TYPE > (기본 quorum)
-    req_type = os.getenv("RECO_REQ_QUEUE_TYPE", os.getenv("MQ_QUEUE_TYPE", "quorum")).strip().lower()
-    req_args = {"x-queue-type": req_type} if req_type else None
-
-    q = await ch.declare_queue(req_name, durable=True, arguments=req_args)
-    log.info(f"[declare] reqQueue name='{req_name}' type='{req_type}'")
-    return q
+    log.info("[publish_reply] -> %s (corr=%s)", url, correlation_id)

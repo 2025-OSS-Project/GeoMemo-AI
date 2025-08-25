@@ -21,10 +21,10 @@ numpy>=1.26.0
 pandas>=2.2.0
 tqdm>=4.66.0
 
-# --- RabbitMQ (AMQP) ---
-aio-pika>=9.4.1         # aiormq 포함. 버전 호환 위해 함께 명시
+# --- AWS SQS ---
+aioboto3>=11.4.0
+boto3>=1.34.0
 aiormq>=6.8.0
-stomp.py>=8.1.0         # (Amazon MQ의 STOMP 사용 시)
 
 # --- Database (MySQL, Async) ---
 SQLAlchemy>=2.0.30
