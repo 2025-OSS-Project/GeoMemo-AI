@@ -157,21 +157,33 @@ def parse_request(payload: Dict[str, Any]):
 # ─────────────────────────────────────────────────────────
 # 발행 (응답) — SQS send_message
 # ─────────────────────────────────────────────────────────
+
 async def publish_result(sqs, body: dict, *, reply_to_url: Optional[str], correlation_id: Optional[str]):
+    # 1) 응답 큐 URL 해석
     url = reply_to_url or RECO_RES_QUEUE_URL
     if not url:
-        # URL이 비어 있으면 이름으로 조회
         url = await _resolve_queue_url(sqs, None, RECO_RES_QUEUE)
+
+    # 2) 페이로드 직렬화
     payload = json.dumps(body, ensure_ascii=False)
-    attrs = {}
+
+    # 3) 선택적 메시지 속성 구성 (비어 있으면 인자 생략)
+    attrs: Dict[str, Any] = {}
     if correlation_id:
-        attrs["correlation_id"] = {"DataType": "String", "StringValue": correlation_id}
-    await sqs.send_message(  # boto3: send_message
-        QueueUrl=url,
-        MessageBody=payload,
-        MessageAttributes=attrs or None,
-    )
+        attrs["correlation_id"] = {"DataType": "String", "StringValue": str(correlation_id)}
+
+    # 4) kwargs 조립 — attrs가 있으면만 MessageAttributes 포함
+    kwargs = {
+        "QueueUrl": url,
+        "MessageBody": payload,
+    }
+    if attrs:
+        kwargs["MessageAttributes"] = attrs  # dict 타입만 허용됨
+
+    # 5) 전송
+    await sqs.send_message(**kwargs)
     log.info(f"[publish] ok → url='{url}', corr='{correlation_id}', bytes={len(payload.encode('utf-8'))}")
+
 
 # ─────────────────────────────────────────────────────────
 # 컨슈머 루프 — ReceiveMessage(Long Poll) → 처리 → Delete
